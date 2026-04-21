@@ -1,0 +1,8 @@
+/internal/
+/docs/
+build/
+dist/
+__pycache__/
+.pytest_cache/
+.venv/
+*.egg-info/
