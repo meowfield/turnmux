@@ -114,13 +114,13 @@ Notes:
 
 ## Telegram Commands
 
-- `/new` starts onboarding for a fresh session
+- `/new` starts setup for a fresh session
 - `/resume` resumes an existing provider session in the current topic
 - `/status` shows the current binding
 - `/history` prints recent transcript history
 - `/interrupt` sends `Ctrl-C`
 - `/kill` kills the bound `tmux` window
-- `/cancel` aborts onboarding
+- `/cancel` cancels the current setup flow
 
 ## Updating
 
