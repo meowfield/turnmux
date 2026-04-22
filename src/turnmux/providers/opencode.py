@@ -42,6 +42,8 @@ class OpenCodeAdapter(ProviderAdapter):
         *,
         started_after: str,
         requested_session_id: str | None = None,
+        tmux_session_name: str | None = None,
+        tmux_window_id: str | None = None,
     ) -> ProviderSession | None:
         started_after_dt = parse_timestamp(started_after)
         started_after_ms = _datetime_to_epoch_ms(started_after_dt) if started_after_dt else None

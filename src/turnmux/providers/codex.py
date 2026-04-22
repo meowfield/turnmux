@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-import shlex
 from typing import Any
 
 from .base import ParseBatch, ProviderAdapter, ProviderSession, ProviderTranscriptEvent, compute_message_hash, parse_timestamp, read_jsonl_tail, shorten_text
@@ -44,6 +43,8 @@ class CodexAdapter(ProviderAdapter):
         *,
         started_after: str,
         requested_session_id: str | None = None,
+        tmux_session_name: str | None = None,
+        tmux_window_id: str | None = None,
     ) -> ProviderSession | None:
         index = self._load_session_index()
         started_after_dt = parse_timestamp(started_after)
@@ -74,31 +75,18 @@ class CodexAdapter(ProviderAdapter):
                     if not isinstance(item, dict):
                         continue
                     if item.get("type") == "output_text" and isinstance(item.get("text"), str) and item["text"].strip():
+                        cleaned_text = _sanitize_codex_output_text(item["text"])
+                        if not cleaned_text:
+                            continue
                         events.append(
                             ProviderTranscriptEvent(
                                 role="assistant",
                                 content_type="text",
-                                text=item["text"].strip(),
+                                text=cleaned_text,
                                 timestamp=timestamp,
                                 is_final=payload.get("phase") != "commentary",
                             )
                         )
-            elif record_type == "event_msg" and payload.get("type") == "exec_command_end" and payload.get("exit_code") not in {None, 0}:
-                command = payload.get("command") or []
-                command_text = shlex.join(command) if isinstance(command, list) else str(command)
-                aggregated_output = payload.get("aggregated_output") or ""
-                summary = f"Command failed ({payload.get('exit_code')}): {command_text}".strip()
-                if isinstance(aggregated_output, str) and aggregated_output.strip():
-                    summary += "\n" + shorten_text(aggregated_output, limit=500)
-                events.append(
-                    ProviderTranscriptEvent(
-                        role="tool",
-                        content_type="shell",
-                        text=summary,
-                        timestamp=timestamp,
-                        is_final=True,
-                    )
-                )
 
         return ParseBatch(
             events=tuple(events),
@@ -129,6 +117,8 @@ class CodexAdapter(ProviderAdapter):
             if record.get("type") == "response_item" and payload.get("type") == "message":
                 role = payload.get("role")
                 text = _extract_codex_message_text(payload)
+                if role == "assistant":
+                    text = _sanitize_codex_output_text(text)
                 if role in {"assistant", "user"} and text:
                     events.append(
                         ProviderTranscriptEvent(
@@ -223,6 +213,28 @@ def _extract_codex_message_text(payload: dict[str, Any]) -> str:
         if item_type in {"output_text", "input_text"} and isinstance(item.get("text"), str):
             parts.append(item["text"].strip())
     return "\n".join(part for part in parts if part).strip()
+
+
+def _sanitize_codex_output_text(text: str) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+
+    cleaned_lines: list[str] = []
+    in_memory_citation_block = False
+    for line in cleaned.splitlines():
+        stripped = line.strip()
+        if stripped == "<oai-mem-citation>":
+            in_memory_citation_block = True
+            continue
+        if in_memory_citation_block:
+            if stripped == "</oai-mem-citation>":
+                in_memory_citation_block = False
+            continue
+        if stripped.startswith("::git-") or stripped.startswith("::code-comment") or stripped.startswith("::git-create-pr"):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
 
 
 def _read_codex_session_meta(transcript_path: Path) -> dict[str, Any] | None:

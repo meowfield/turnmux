@@ -5,10 +5,12 @@ import sqlite3
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 from turnmux.config import TurnmuxConfig
 from turnmux.providers import ProviderRegistry
 from turnmux.providers.claude import ClaudeAdapter
+from turnmux.providers.claude_session_hook import ClaudeSessionMapEntry
 from turnmux.providers.codex import CodexAdapter
 from turnmux.providers.opencode import OpenCodeAdapter
 from turnmux.state.models import ProviderName
@@ -48,6 +50,17 @@ class ProviderRegistryTests(unittest.TestCase):
 
             registry = ProviderRegistry(config)
             self.assertEqual(registry.available_providers(), (ProviderName.CODEX,))
+
+    def test_registry_passes_runtime_home_to_claude_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            runtime_home = tmp_path / "runtime-home"
+
+            registry = ProviderRegistry(make_config(tmp_path), runtime_home=runtime_home)
+
+            claude = registry.get(ProviderName.CLAUDE)
+            self.assertIsInstance(claude, ClaudeAdapter)
+            self.assertEqual(claude.runtime_home, runtime_home.resolve(strict=False))
 
 
 class ClaudeAdapterTests(unittest.TestCase):
@@ -164,6 +177,82 @@ class ClaudeAdapterTests(unittest.TestCase):
             assert discovered is not None
             self.assertEqual(discovered.session_id, "session-claude")
 
+    def test_discover_session_uses_session_map_entry_for_exact_window_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            repo_path = tmp_path / "repo"
+            repo_path.mkdir()
+            runtime_home = tmp_path / "runtime-home"
+
+            claude_root = tmp_path / ".claude"
+            project_dir = claude_root / "projects" / str(repo_path.resolve()).replace("/", "-")
+            project_dir.mkdir(parents=True)
+            transcript_path = project_dir / "session-hooked.jsonl"
+            transcript_path.write_text(
+                f'{{"type":"assistant","sessionId":"session-hooked","cwd":"{repo_path.resolve()}","timestamp":"2026-04-20T10:01:00Z","message":{{"role":"assistant","content":[{{"type":"text","text":"hello"}}]}}}}\n',
+                encoding="utf-8",
+            )
+
+            adapter = ClaudeAdapter(make_config(tmp_path), claude_home=claude_root, runtime_home=runtime_home)
+            entry = ClaudeSessionMapEntry(
+                session_id="session-hooked",
+                cwd=repo_path.resolve(),
+                window_name="claude:repo",
+                source_path=tmp_path / "claude_session_map.json",
+            )
+            with patch("turnmux.providers.claude.find_claude_session_map_entry", return_value=entry) as find_entry:
+                discovered = adapter.discover_session(
+                    repo_path,
+                    started_after="2026-04-20T10:00:00+00:00",
+                    tmux_session_name="turnmux",
+                    tmux_window_id="@12",
+                )
+
+            self.assertIsNotNone(discovered)
+            assert discovered is not None
+            self.assertEqual(discovered.session_id, "session-hooked")
+            find_entry.assert_called_once_with("turnmux", "@12", runtime_home=runtime_home.resolve(strict=False))
+
+    def test_list_resumable_sessions_uses_sessions_index_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            repo_path = tmp_path / "repo"
+            repo_path.mkdir()
+
+            claude_root = tmp_path / ".claude"
+            project_dir = claude_root / "projects" / str(repo_path.resolve()).replace("/", "-")
+            project_dir.mkdir(parents=True)
+            nested_dir = tmp_path / "nested"
+            nested_dir.mkdir()
+            transcript_path = nested_dir / "indexed-session.jsonl"
+            transcript_path.write_text(
+                f'{{"type":"assistant","sessionId":"indexed-session","cwd":"{repo_path.resolve()}","timestamp":"2026-04-20T10:01:00Z","message":{{"role":"assistant","content":[{{"type":"text","text":"hello"}}]}}}}\n',
+                encoding="utf-8",
+            )
+            (project_dir / "sessions-index.json").write_text(
+                textwrap.dedent(
+                    f"""
+                    {{
+                      "entries": [
+                        {{
+                          "sessionId": "indexed-session",
+                          "fullPath": "{transcript_path.resolve()}",
+                          "projectPath": "{repo_path.resolve()}"
+                        }}
+                      ]
+                    }}
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            adapter = ClaudeAdapter(make_config(tmp_path), claude_home=claude_root)
+            sessions = adapter.list_resumable_sessions(repo_path)
+
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0].session_id, "indexed-session")
+
 
 class CodexAdapterTests(unittest.TestCase):
     def test_lists_resumable_sessions_and_parses_rollout(self) -> None:
@@ -187,8 +276,9 @@ class CodexAdapterTests(unittest.TestCase):
                 textwrap.dedent(
                     f"""
                     {{"type":"session_meta","timestamp":"2026-04-20T10:00:00Z","payload":{{"id":"session-codex","cwd":"{repo_path.resolve()}","timestamp":"2026-04-20T10:00:00Z"}}}}
-                    {{"type":"response_item","timestamp":"2026-04-20T10:01:00Z","payload":{{"type":"message","role":"assistant","phase":"commentary","content":[{{"type":"output_text","text":"Reviewing auth flow"}}]}}}}
+                    {{"type":"response_item","timestamp":"2026-04-20T10:01:00Z","payload":{{"type":"message","role":"assistant","phase":"commentary","content":[{{"type":"output_text","text":"Reviewing auth flow\\n\\n<oai-mem-citation>\\n<citation_entries>\\nMEMORY.md:1-2|note=[noise]\\n</citation_entries>\\n<rollout_ids>\\nabc\\n</rollout_ids>\\n</oai-mem-citation>\\n::git-stage{{cwd=\\"/tmp/repo\\"}}"}}]}}}}
                     {{"type":"event_msg","timestamp":"2026-04-20T10:02:00Z","payload":{{"type":"exec_command_end","command":["bash","-lc","pytest"],"exit_code":1,"aggregated_output":"tests failed"}}}}
+                    {{"type":"response_item","timestamp":"2026-04-20T10:03:00Z","payload":{{"type":"message","role":"assistant","phase":"final_answer","content":[{{"type":"output_text","text":"Auth flow is fixed.\\n::git-stage{{cwd=\\"/tmp/repo\\"}}"}}]}}}}
                     """
                 ).strip()
                 + "\n",
@@ -201,8 +291,69 @@ class CodexAdapterTests(unittest.TestCase):
             self.assertEqual(sessions[0].display_name, "Implement auth")
 
             batch = adapter.parse_new_events(rollout_path, 0)
+            self.assertEqual(len(batch.events), 2)
             self.assertEqual(batch.events[0].text, "Reviewing auth flow")
-            self.assertIn("Command failed", batch.events[1].text)
+            self.assertFalse(batch.events[0].is_final)
+            self.assertEqual(batch.events[1].text, "Auth flow is fixed.")
+            self.assertTrue(batch.events[1].is_final)
+
+    def test_history_includes_codex_commentary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            repo_path = tmp_path / "repo"
+            repo_path.mkdir()
+
+            codex_root = tmp_path / ".codex"
+            sessions_dir = codex_root / "sessions" / "2026" / "04" / "20"
+            sessions_dir.mkdir(parents=True)
+            rollout_path = sessions_dir / "rollout-2026-04-20T10-00-00-session-codex.jsonl"
+            rollout_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    {{"type":"session_meta","timestamp":"2026-04-20T10:00:00Z","payload":{{"id":"session-codex","cwd":"{repo_path.resolve()}","timestamp":"2026-04-20T10:00:00Z"}}}}
+                    {{"type":"response_item","timestamp":"2026-04-20T10:00:01Z","payload":{{"type":"message","role":"assistant","phase":"commentary","content":[{{"type":"output_text","text":"Thinking out loud"}}]}}}}
+                    {{"type":"response_item","timestamp":"2026-04-20T10:00:02Z","payload":{{"type":"message","role":"assistant","phase":"final_answer","content":[{{"type":"output_text","text":"Final answer only"}}]}}}}
+                    {{"type":"response_item","timestamp":"2026-04-20T10:00:03Z","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"Investigate flaky auth redirect"}}]}}}}
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            adapter = CodexAdapter(make_config(tmp_path), codex_home=codex_root)
+            history = adapter.history(rollout_path, limit=10)
+            self.assertEqual([event.role for event in history], ["assistant", "assistant", "user"])
+            self.assertEqual([event.text for event in history], ["Thinking out loud", "Final answer only", "Investigate flaky auth redirect"])
+            self.assertEqual([event.is_final for event in history], [False, True, True])
+
+    def test_sanitize_preserves_literal_citation_tag_mentions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            repo_path = tmp_path / "repo"
+            repo_path.mkdir()
+
+            codex_root = tmp_path / ".codex"
+            sessions_dir = codex_root / "sessions" / "2026" / "04" / "20"
+            sessions_dir.mkdir(parents=True)
+            rollout_path = sessions_dir / "rollout-2026-04-20T10-00-00-session-codex.jsonl"
+            rollout_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    {{"type":"session_meta","timestamp":"2026-04-20T10:00:00Z","payload":{{"id":"session-codex","cwd":"{repo_path.resolve()}","timestamp":"2026-04-20T10:00:00Z"}}}}
+                    {{"type":"response_item","timestamp":"2026-04-20T10:00:02Z","payload":{{"type":"message","role":"assistant","phase":"final_answer","content":[{{"type":"output_text","text":"`codex` adapter now cleans literal `<oai-mem-citation>` mentions safely."}}]}}}}
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            adapter = CodexAdapter(make_config(tmp_path), codex_home=codex_root)
+            batch = adapter.parse_new_events(rollout_path, 0)
+            self.assertEqual(len(batch.events), 1)
+            self.assertEqual(
+                batch.events[0].text,
+                "`codex` adapter now cleans literal `<oai-mem-citation>` mentions safely.",
+            )
 
     def test_build_resume_command_uses_explicit_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

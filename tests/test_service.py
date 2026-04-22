@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from turnmux.app.service import AppService
 from turnmux.config import TurnmuxConfig
-from turnmux.providers.base import ParseBatch
+from turnmux.providers.base import ParseBatch, ProviderTranscriptEvent
 from turnmux.state.db import bootstrap_database
 from turnmux.state.models import BindingStatus, ProviderName
 from turnmux.state.repository import StateRepository
@@ -45,7 +45,15 @@ class FakeAdapter:
     def build_resume_command(self, repo_path: Path, session_id: str) -> list[str]:
         return ["fake-provider", "--resume", session_id, str(repo_path)]
 
-    def discover_session(self, repo_path: Path, *, started_after: str, requested_session_id: str | None = None):
+    def discover_session(
+        self,
+        repo_path: Path,
+        *,
+        started_after: str,
+        requested_session_id: str | None = None,
+        tmux_session_name: str | None = None,
+        tmux_window_id: str | None = None,
+    ):
         return None
 
     def parse_new_events(self, transcript_path: Path, offset: int, *, session_id: str | None = None) -> ParseBatch:
@@ -170,10 +178,16 @@ class AppServiceTests(unittest.TestCase):
     def test_send_user_text_launches_pending_fresh_binding_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             base_dir = Path(tmp_dir)
+            runtime_home = base_dir / "runtime-home"
             db_path = base_dir / "state.db"
             bootstrap_database(db_path)
             repository = StateRepository(db_path)
-            service = AppService(config=make_config(base_dir), repository=repository, providers=FakeRegistry(FakeAdapter()))
+            service = AppService(
+                config=make_config(base_dir),
+                repository=repository,
+                providers=FakeRegistry(FakeAdapter()),
+                runtime_home=runtime_home,
+            )
 
             binding = repository.save_binding(
                 chat_id=1,
@@ -192,7 +206,11 @@ class AppServiceTests(unittest.TestCase):
             ):
                 service.send_user_text(binding, "hello from telegram")
 
-            ensure_trust.assert_called_once_with(ProviderName.CODEX, base_dir)
+            ensure_trust.assert_called_once_with(
+                ProviderName.CODEX,
+                base_dir,
+                runtime_home=runtime_home.resolve(strict=False),
+            )
             launch_command.assert_called_once_with("@11", ["fake-provider", str(base_dir), "hello from telegram"])
             pending = repository.get_pending_launch(binding.id)
             self.assertIsNotNone(pending)
@@ -287,3 +305,174 @@ class AppServiceTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "waiting for an approval decision"):
                 service.send_user_text(binding, "next command")
+
+    def test_refresh_formats_non_final_transcript_events_as_progress_updates(self) -> None:
+        class ProgressAdapter(FakeAdapter):
+            def parse_new_events(self, transcript_path: Path, offset: int, *, session_id: str | None = None) -> ParseBatch:
+                return ParseBatch(
+                    events=(
+                        ProviderTranscriptEvent(
+                            role="assistant",
+                            content_type="text",
+                            text="Checking git diff",
+                            timestamp="2026-04-22T12:00:00Z",
+                            is_final=False,
+                        ),
+                        ProviderTranscriptEvent(
+                            role="assistant",
+                            content_type="text",
+                            text="Final verdict",
+                            timestamp="2026-04-22T12:01:00Z",
+                            is_final=True,
+                        ),
+                    ),
+                    new_offset=10,
+                    last_event_ts="2026-04-22T12:01:00Z",
+                    last_message_hash="hash",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            db_path = base_dir / "state.db"
+            bootstrap_database(db_path)
+            repository = StateRepository(db_path)
+            service = AppService(config=make_config(base_dir), repository=repository, providers=FakeRegistry(ProgressAdapter()))
+
+            transcript_path = base_dir / "transcript.jsonl"
+            transcript_path.write_text("", encoding="utf-8")
+            binding = repository.save_binding(
+                chat_id=1,
+                thread_id=10,
+                provider=ProviderName.CODEX,
+                repo_path=base_dir,
+                tmux_session_name="turnmux",
+                tmux_window_id="@12",
+                tmux_window_name="codex:tmp",
+                provider_session_id="session-123",
+                transcript_path=transcript_path,
+                status=BindingStatus.ACTIVE,
+            )
+
+            with patch("turnmux.app.service.tmux.window_exists", return_value=True):
+                outbound = service.refresh_pending_and_active_bindings()
+
+            self.assertEqual([message.text for message in outbound], ["Checking git diff", "Final verdict"])
+            self.assertIsNone(repository.get_monitor_offset(binding.id))
+            service.mark_outbound_delivered(outbound[0])
+            self.assertIsNone(repository.get_monitor_offset(binding.id))
+            service.mark_outbound_delivered(outbound[1])
+            offset = repository.get_monitor_offset(binding.id)
+            assert offset is not None
+            self.assertEqual(offset.byte_offset, 10)
+            self.assertEqual(offset.last_event_ts, "2026-04-22T12:01:00Z")
+            self.assertEqual(offset.last_message_hash, "hash")
+
+    def test_history_text_labels_non_final_events_as_progress(self) -> None:
+        class HistoryAdapter(FakeAdapter):
+            def history(self, transcript_path: Path, *, session_id: str | None = None, limit: int = 10):
+                return [
+                    ProviderTranscriptEvent(
+                        role="assistant",
+                        content_type="text",
+                        text="Checking git diff",
+                        timestamp="2026-04-22T12:00:00Z",
+                        is_final=False,
+                    ),
+                    ProviderTranscriptEvent(
+                        role="assistant",
+                        content_type="text",
+                        text="Final verdict",
+                        timestamp="2026-04-22T12:01:00Z",
+                        is_final=True,
+                    ),
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            db_path = base_dir / "state.db"
+            bootstrap_database(db_path)
+            repository = StateRepository(db_path)
+            service = AppService(config=make_config(base_dir), repository=repository, providers=FakeRegistry(HistoryAdapter()))
+
+            transcript_path = base_dir / "transcript.jsonl"
+            transcript_path.write_text("", encoding="utf-8")
+            binding = repository.save_binding(
+                chat_id=1,
+                thread_id=10,
+                provider=ProviderName.CODEX,
+                repo_path=base_dir,
+                tmux_session_name="turnmux",
+                tmux_window_id="@12",
+                tmux_window_name="codex:tmp",
+                provider_session_id="session-123",
+                transcript_path=transcript_path,
+                status=BindingStatus.ACTIVE,
+            )
+
+            history = service.history_text(binding)
+            self.assertEqual(history, "[progress] Checking git diff\n\n[assistant] Final verdict")
+
+    def test_refresh_promotes_pending_launch_without_activation_message(self) -> None:
+        class DiscoveringAdapter(FakeAdapter):
+            def __init__(self, transcript_path: Path) -> None:
+                self._transcript_path = transcript_path
+
+            def discover_session(
+                self,
+                repo_path: Path,
+                *,
+                started_after: str,
+                requested_session_id: str | None = None,
+                tmux_session_name: str | None = None,
+                tmux_window_id: str | None = None,
+            ):
+                return type(
+                    "Session",
+                    (),
+                    {
+                        "session_id": "session-123",
+                        "display_name": "Latest task",
+                        "updated_at": "2026-04-22T12:00:00Z",
+                        "repo_path": repo_path,
+                        "transcript_path": self._transcript_path,
+                    },
+                )()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            db_path = base_dir / "state.db"
+            bootstrap_database(db_path)
+            repository = StateRepository(db_path)
+            transcript_path = base_dir / "transcript.jsonl"
+            transcript_path.write_text("", encoding="utf-8")
+            service = AppService(
+                config=make_config(base_dir),
+                repository=repository,
+                providers=FakeRegistry(DiscoveringAdapter(transcript_path)),
+            )
+
+            binding = repository.save_binding(
+                chat_id=1,
+                thread_id=10,
+                provider=ProviderName.CODEX,
+                repo_path=base_dir,
+                tmux_session_name="turnmux",
+                tmux_window_id="@12",
+                tmux_window_name="codex:tmp",
+                status=BindingStatus.PENDING_START,
+            )
+            repository.save_pending_launch(
+                binding_id=binding.id,
+                provider=ProviderName.CODEX,
+                repo_path=base_dir,
+                discovery_deadline_at=(datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+            )
+
+            with patch("turnmux.app.service.tmux.window_exists", return_value=True):
+                outbound = service.refresh_pending_and_active_bindings()
+
+            self.assertEqual(outbound, [])
+            rebound = repository.get_binding_by_id(binding.id)
+            assert rebound is not None
+            self.assertEqual(rebound.status, BindingStatus.ACTIVE)
+            self.assertEqual(rebound.provider_session_id, "session-123")

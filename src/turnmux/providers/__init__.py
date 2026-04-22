@@ -6,10 +6,10 @@ from ..state.models import ProviderName
 
 
 class ProviderRegistry:
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, runtime_home=None) -> None:
         self._providers = {}
         if config.claude_command:
-            self._providers[ProviderName.CLAUDE] = ClaudeAdapter(config)
+            self._providers[ProviderName.CLAUDE] = ClaudeAdapter(config, runtime_home=runtime_home)
         if config.codex_command:
             self._providers[ProviderName.CODEX] = CodexAdapter(config)
         if config.opencode_command:

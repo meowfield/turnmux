@@ -11,6 +11,14 @@ from ..state.models import ProviderName
 OPTION_LINE_RE = re.compile(r"^\s*(?P<key>[0-9A-Za-z])(?:\s*[\).\]:-])\s+(?P<label>.+?)\s*$")
 BRACKET_OPTION_RE = re.compile(r"^\s*\[(?P<key>[0-9A-Za-z])\]\s*(?P<label>.+?)\s*$")
 YES_NO_RE = re.compile(r"\[(?P<yes>[Yy])(?:es)?\s*/\s*(?P<no>[Nn])(?:o)?\]")
+CLAUDE_ENTER_ESCAPE_TOP_PATTERNS = (
+    re.compile(r"^\s*Do you want to proceed\?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*Do you want to make this edit", re.IGNORECASE),
+    re.compile(r"^\s*Do you want to create \S", re.IGNORECASE),
+    re.compile(r"^\s*Do you want to delete \S", re.IGNORECASE),
+    re.compile(r"^\s*Bash command\s*$", re.IGNORECASE),
+    re.compile(r"^\s*This command requires approval", re.IGNORECASE),
+)
 APPROVAL_CONTEXT_PATTERNS = (
     "approval",
     "approve",
@@ -63,7 +71,13 @@ def detect_approval_request(provider: ProviderName, pane_text: str) -> ApprovalR
     if not lines:
         return None
 
-    detectors = (_detect_claude_bypass_warning, _detect_numbered_or_lettered_choices, _detect_yes_no_prompt, _detect_enter_escape_prompt)
+    detectors = (
+        _detect_claude_bypass_warning,
+        _detect_claude_enter_escape_prompt,
+        _detect_numbered_or_lettered_choices,
+        _detect_yes_no_prompt,
+        _detect_enter_escape_prompt,
+    )
     for detector in detectors:
         request = detector(provider, lines)
         if request is not None:
@@ -120,6 +134,36 @@ def _detect_numbered_or_lettered_choices(provider: ProviderName, lines: list[str
         approve_keys=(approve.key, "Enter"),
         deny_keys=(deny.key, "Enter"),
     )
+
+
+def _detect_claude_enter_escape_prompt(provider: ProviderName, lines: list[str]) -> ApprovalRequest | None:
+    if provider != ProviderName.CLAUDE:
+        return None
+
+    top_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if any(pattern.search(line) for pattern in CLAUDE_ENTER_ESCAPE_TOP_PATTERNS)
+        ),
+        None,
+    )
+    if top_index is None:
+        return None
+
+    bottom_index = next(
+        (
+            index
+            for index in range(top_index + 1, len(lines))
+            if "esc to cancel" in lines[index].lower()
+        ),
+        None,
+    )
+    if bottom_index is None:
+        return None
+
+    prompt_text = _excerpt(lines, top_index, bottom_index)
+    return _approval_request(prompt_text, approve_keys=("Enter",), deny_keys=("Escape",))
 
 
 def _detect_yes_no_prompt(provider: ProviderName, lines: list[str]) -> ApprovalRequest | None:

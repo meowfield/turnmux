@@ -72,6 +72,8 @@ class ProviderAdapter(ABC):
         *,
         started_after: str,
         requested_session_id: str | None = None,
+        tmux_session_name: str | None = None,
+        tmux_window_id: str | None = None,
     ) -> ProviderSession | None:
         raise NotImplementedError
 

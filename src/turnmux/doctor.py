@@ -12,6 +12,7 @@ from .providers import ProviderRegistry
 from .runtime.binaries import resolve_binary
 from .providers.trust import (
     is_claude_skip_dangerous_prompt_enabled,
+    is_claude_session_start_hook_installed,
     is_provider_trusted,
 )
 from .runtime.home import RuntimePaths, set_private_file_permissions
@@ -150,7 +151,7 @@ def run_doctor(
 
     lines.extend(_config_checks(config))
     if repo_path is not None:
-        lines.extend(_repo_checks(config, repo_path))
+        lines.extend(_repo_checks(config, repo_path, runtime_paths=runtime_paths))
     lines.extend(_service_checks(runtime_paths))
 
     lines.append(
@@ -211,7 +212,7 @@ def _config_checks(config: TurnmuxConfig) -> list[str]:
     return lines
 
 
-def _repo_checks(config: TurnmuxConfig, repo_path: Path) -> list[str]:
+def _repo_checks(config: TurnmuxConfig, repo_path: Path, *, runtime_paths: RuntimePaths) -> list[str]:
     lines: list[str] = []
     try:
         normalized_repo = validate_repo_path(repo_path, config.allowed_roots)
@@ -220,7 +221,7 @@ def _repo_checks(config: TurnmuxConfig, repo_path: Path) -> list[str]:
         return lines
 
     lines.append(f"[ok] repo path: {normalized_repo}")
-    registry = ProviderRegistry(config)
+    registry = ProviderRegistry(config, runtime_home=runtime_paths.home)
     for provider in registry.available_providers():
         trust_state = "ok" if is_provider_trusted(provider, normalized_repo) else "warn"
         trust_suffix = "trusted" if trust_state == "ok" else "not trusted yet"
@@ -229,6 +230,9 @@ def _repo_checks(config: TurnmuxConfig, repo_path: Path) -> list[str]:
             prompt_state = "ok" if is_claude_skip_dangerous_prompt_enabled() else "warn"
             prompt_suffix = "enabled" if prompt_state == "ok" else "not enabled yet"
             lines.append(f"[{prompt_state}] claude dangerous-mode prompt skip: {prompt_suffix}")
+            hook_state = "ok" if is_claude_session_start_hook_installed(runtime_home=runtime_paths.home) else "warn"
+            hook_suffix = "installed" if hook_state == "ok" else "not installed yet"
+            lines.append(f"[{hook_state}] claude SessionStart hook: {hook_suffix}")
         try:
             count = len(registry.get(provider).list_resumable_sessions(normalized_repo, limit=5))
         except Exception as exc:

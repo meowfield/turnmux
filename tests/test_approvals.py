@@ -49,6 +49,36 @@ class ApprovalDetectionTests(unittest.TestCase):
         self.assertEqual(request.approve_keys, ("y", "Enter"))
         self.assertEqual(request.deny_keys, ("n", "Enter"))
 
+    def test_detects_claude_enter_escape_permission_prompt(self) -> None:
+        request = detect_approval_request(
+            ProviderName.CLAUDE,
+            (
+                "Do you want to make this edit to settings.json?\n"
+                "This will update the local project configuration.\n"
+                "Esc to cancel\n"
+            ),
+        )
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.approve_keys, ("Enter",))
+        self.assertEqual(request.deny_keys, ("Escape",))
+
+    def test_detects_claude_bash_approval_prompt(self) -> None:
+        request = detect_approval_request(
+            ProviderName.CLAUDE,
+            (
+                "Bash command\n"
+                "git push origin main\n"
+                "Esc to cancel\n"
+            ),
+        )
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.approve_keys, ("Enter",))
+        self.assertEqual(request.deny_keys, ("Escape",))
+
     def test_ignores_regular_transcript_text(self) -> None:
         request = detect_approval_request(
             ProviderName.CODEX,

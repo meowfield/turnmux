@@ -25,7 +25,7 @@ from ..app.service import (
     encode_resume_candidates,
 )
 from ..providers import ProviderRegistry
-from ..providers.base import ProviderSession
+from ..providers.base import ProviderSession, shorten_text
 from ..runtime.home import RuntimePaths
 from ..runtime.lifecycle import HeartbeatWriter, install_asyncio_exception_logging, install_unix_signal_handlers
 from ..state.models import BindingStatus, OnboardingStep, ProviderName
@@ -76,8 +76,13 @@ class TurnmuxTelegramBot:
         self.providers = providers
         self.available_providers = providers.available_providers()
         self.repository = repository
-        self.service = AppService(config=config, repository=repository, providers=providers)
         self.runtime_paths = runtime_paths
+        self.service = AppService(
+            config=config,
+            repository=repository,
+            providers=providers,
+            runtime_home=runtime_paths.home if runtime_paths is not None else None,
+        )
         self._monitor_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._heartbeat_writer: HeartbeatWriter | None = None
@@ -326,6 +331,10 @@ class TurnmuxTelegramBot:
             await self._handle_audio_message(update, message)
             return
 
+        if not _has_user_attachment(message):
+            logger.info("Ignoring non-content Telegram message chat_id=%s thread_id=%s", chat_id, thread_id)
+            return
+
         await self._handle_attachment(update, message)
 
     async def _handle_audio_message(self, update: Update, message) -> None:
@@ -352,7 +361,8 @@ class TurnmuxTelegramBot:
         if not transcribed.strip():
             await self._reply(update, "The transcription was empty. Try a clearer or shorter recording.")
             return
-        await self._route_incoming_text(update, transcribed)
+        await self._reply(update, _format_transcribed_audio_message(transcribed))
+        await self._route_incoming_text(update, transcribed, from_audio=True)
 
     async def _handle_attachment(self, update: Update, message) -> None:
         attachment_kind = _attachment_kind(message)
@@ -368,7 +378,7 @@ class TurnmuxTelegramBot:
             f"Unsupported attachment type: {attachment_kind}. Send text, voice, or audio.",
         )
 
-    async def _route_incoming_text(self, update: Update, raw_text: str) -> None:
+    async def _route_incoming_text(self, update: Update, raw_text: str, *, from_audio: bool = False) -> None:
         text = raw_text.strip()
         if not text:
             return
@@ -395,7 +405,7 @@ class TurnmuxTelegramBot:
                 )
                 await self._reply(
                     update,
-                    "Choose a provider for this topic.\nYour first message is saved and will be sent after setup.",
+                    _format_provider_prompt(seed_text),
                     reply_markup=_build_provider_keyboard(self.available_providers),
                 )
                 return
@@ -410,6 +420,9 @@ class TurnmuxTelegramBot:
         except Exception as exc:
             logger.exception("Failed to forward user text")
             await self._reply(update, f"Failed to send text to the live session: {exc}")
+            return
+        if _should_send_progress_ack(text, from_audio=from_audio):
+            await self._reply(update, _format_progress_ack(binding.provider))
 
     async def _handle_onboarding_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ensure_allowed(update):
@@ -879,11 +892,16 @@ class TurnmuxTelegramBot:
             except Exception:
                 logger.exception("Failed to auto-send saved first message")
         self.repository.clear_onboarding_state(chat_id, thread_id)
-        status_note = f"Binding created for {provider.value} at {repo_path}.\nStatus: {binding.status.value}"
+        repo_label = _repo_button_label(repo_path)
+        status_note = f"Started {provider.value} for `{repo_label}`."
         if auto_sent:
-            status_note += "\nYour first message was sent to start the session."
+            status_note += f"\n{_format_sent_seed_message(provider, seed_text or '')}"
+        elif mode == "fresh" and binding.status == BindingStatus.PENDING_START:
+            status_note += "\nSend the first message in this topic to start the session."
         elif binding.status == BindingStatus.PENDING_START:
-            status_note += "\nThe tmux window is ready. Send the first message in this topic to let the provider create its transcript and activate the binding."
+            status_note += "\nSession is starting. I will post here when it becomes active."
+        elif binding.status == BindingStatus.ACTIVE:
+            status_note += "\nSession is active."
         await self._maybe_name_topic(update, provider=provider, repo_path=repo_path)
         await self._reply(
             update,
@@ -902,6 +920,7 @@ class TurnmuxTelegramBot:
                         text=message.text,
                         reply_markup=_build_approval_keyboard(has_deny=message.markup_has_deny) if message.markup_kind == "approval" else None,
                     )
+                    self.service.mark_outbound_delivered(message)
                 self._set_runtime_health("running")
             except asyncio.CancelledError:
                 raise
@@ -945,6 +964,8 @@ class TurnmuxTelegramBot:
 
     async def _ensure_allowed(self, update: Update) -> bool:
         user = update.effective_user
+        if user is None or getattr(user, "is_bot", False):
+            return False
         if user and user.id in self.config.allowed_user_ids:
             return True
         await self._reply(update, "You are not allowed to use this TurnMux bot.")
@@ -985,11 +1006,7 @@ class TurnmuxTelegramBot:
             message.get_bot(),
             chat_id=chat.id,
             thread_id=forum_topic.message_thread_id,
-            text=(
-                "Choose a provider for this topic.\nYour first message is saved and will be sent after setup."
-                if seed_text
-                else "Choose a provider for this topic."
-            ),
+            text=_format_provider_prompt(seed_text),
             reply_markup=_build_provider_keyboard(self.available_providers),
         )
         followup = f"Created topic `{topic_name}`. Continue there."
@@ -1196,7 +1213,63 @@ def _attachment_kind(message) -> str:
         value = getattr(message, field_name, None)
         if value:
             return field_name
+    effective_attachment = getattr(message, "effective_attachment", None)
+    if effective_attachment is not None:
+        if isinstance(effective_attachment, list):
+            return "photo"
+        return _camel_to_snake(type(effective_attachment).__name__)
     return "attachment"
+
+
+def _format_provider_prompt(seed_text: str | None) -> str:
+    if not seed_text:
+        return "Choose a provider for this topic."
+    excerpt = _seed_text_excerpt(seed_text, limit=160)
+    return (
+        f'Saved first message: "{excerpt}"\n\n'
+        "Choose a provider for this topic.\n"
+        "It will be sent after setup."
+    )
+
+
+def _seed_text_excerpt(seed_text: str, *, limit: int = 160) -> str:
+    return shorten_text(" ".join(seed_text.split()), limit=limit)
+
+
+def _format_sent_seed_message(provider: ProviderName, seed_text: str) -> str:
+    return f'Sent to {provider.value}: "{_seed_text_excerpt(seed_text, limit=200)}"'
+
+
+def _format_transcribed_audio_message(text: str) -> str:
+    normalized = text.strip()
+    return f"Transcribed audio:\n{normalized}"
+
+
+def _should_send_progress_ack(text: str, *, from_audio: bool) -> bool:
+    if from_audio:
+        return True
+    compact = " ".join(text.split())
+    return len(compact) >= 240 or "\n" in text
+
+
+def _format_progress_ack(provider: ProviderName) -> str:
+    return f"Sent to {provider.value}. I will post progress updates here."
+
+
+def _has_user_attachment(message) -> bool:
+    effective_attachment = getattr(message, "effective_attachment", None)
+    if effective_attachment is not None:
+        return True
+    return _attachment_kind(message) != "attachment"
+
+
+def _camel_to_snake(value: str) -> str:
+    letters: list[str] = []
+    for index, char in enumerate(value):
+        if char.isupper() and index > 0 and not value[index - 1].isupper():
+            letters.append("_")
+        letters.append(char.lower())
+    return "".join(letters)
 
 
 def _build_start_keyboard() -> InlineKeyboardMarkup:

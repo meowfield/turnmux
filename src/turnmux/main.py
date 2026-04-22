@@ -11,6 +11,7 @@ from .config import ConfigError, load_config
 from .doctor import run_doctor, write_sample_config
 from .log_setup import configure_logging
 from .providers import ProviderRegistry
+from .providers.claude_session_hook import process_claude_session_start_hook
 from .runtime.home import RuntimePaths, initialize_runtime_home
 from .runtime.lifecycle import install_global_exception_logging
 from .service_manager import (
@@ -57,6 +58,14 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--repo", type=Path, default=None, help="Optionally validate a repo path and show provider resume counts.")
     run_parser = subparsers.add_parser("run", help="Run the Telegram bot and monitor loop.")
     add_common_args(run_parser)
+    hook_parser = subparsers.add_parser("hook", help="Run internal provider hooks.")
+    add_common_args(hook_parser)
+    hook_subparsers = hook_parser.add_subparsers(dest="hook_command")
+    claude_hook_parser = hook_subparsers.add_parser(
+        "claude-session-start",
+        help="Internal Claude SessionStart hook handler.",
+    )
+    add_common_args(claude_hook_parser)
     service_parser = subparsers.add_parser("service", help="Manage the persistent macOS launchd service.")
     add_common_args(service_parser)
     service_subparsers = service_parser.add_subparsers(dest="service_command")
@@ -103,6 +112,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(report.text)
         return 0 if report.ok else 1
 
+    if command == "hook":
+        if args.hook_command == "claude-session-start":
+            return process_claude_session_start_hook(runtime_home=runtime_paths.home)
+        logger.error("Unknown hook command.")
+        return 1
+
     if command == "service":
         return handle_service_command(args, runtime_paths, config_path)
 
@@ -140,7 +155,7 @@ async def run_bot(runtime_paths: RuntimePaths, config) -> int:
     from .transport.telegram_bot import TurnmuxTelegramBot
 
     repository = StateRepository(runtime_paths.state_db_path)
-    providers = ProviderRegistry(config)
+    providers = ProviderRegistry(config, runtime_home=runtime_paths.home)
     bot = TurnmuxTelegramBot(config=config, repository=repository, providers=providers, runtime_paths=runtime_paths)
     await bot.run()
     return 0

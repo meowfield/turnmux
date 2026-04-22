@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 from typing import Any
 
+from .claude_session_hook import find_claude_session_map_entry
 from .base import ParseBatch, ProviderAdapter, ProviderSession, ProviderTranscriptEvent, compute_message_hash, parse_timestamp, read_jsonl_tail, shorten_text
 from ..state.models import ProviderName
 
@@ -14,10 +15,18 @@ from ..state.models import ProviderName
 class ClaudeAdapter(ProviderAdapter):
     name = ProviderName.CLAUDE
 
-    def __init__(self, config, claude_home: Path | None = None) -> None:
+    def __init__(
+        self,
+        config,
+        claude_home: Path | None = None,
+        *,
+        runtime_home: Path | None = None,
+    ) -> None:
         super().__init__(config)
         base_dir = claude_home or Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
         self.projects_root = base_dir / "projects"
+        self.session_index_filename = "sessions-index.json"
+        self.runtime_home = runtime_home.expanduser().resolve(strict=False) if runtime_home is not None else None
 
     def build_start_command(self, repo_path: Path, *, initial_prompt: str | None = None) -> list[str]:
         command = list(self.config.claude_command)
@@ -30,7 +39,7 @@ class ClaudeAdapter(ProviderAdapter):
 
     def list_resumable_sessions(self, repo_path: Path, *, limit: int = 5) -> list[ProviderSession]:
         sessions: list[ProviderSession] = []
-        for path in self._candidate_project_files(repo_path):
+        for path in self._candidate_project_files(repo_path, limit=max(limit * 3, 15)):
             session = self._session_from_transcript(path, repo_path)
             if session:
                 sessions.append(session)
@@ -44,7 +53,28 @@ class ClaudeAdapter(ProviderAdapter):
         *,
         started_after: str,
         requested_session_id: str | None = None,
+        tmux_session_name: str | None = None,
+        tmux_window_id: str | None = None,
     ) -> ProviderSession | None:
+        normalized_repo = repo_path.resolve(strict=False)
+
+        if tmux_session_name and tmux_window_id:
+            mapped = find_claude_session_map_entry(
+                tmux_session_name,
+                tmux_window_id,
+                runtime_home=self.runtime_home,
+            )
+            if mapped and (mapped.cwd is None or mapped.cwd == normalized_repo):
+                mapped_session_id = requested_session_id or mapped.session_id
+                exact = self._session_from_known_id(repo_path, mapped_session_id)
+                if exact:
+                    return exact
+
+        if requested_session_id:
+            exact = self._session_from_known_id(repo_path, requested_session_id)
+            if exact:
+                return exact
+
         started_after_dt = parse_timestamp(started_after)
         for path in self._candidate_project_files(repo_path, limit=30):
             session = self._session_from_transcript(path, repo_path)
@@ -135,20 +165,78 @@ class ClaudeAdapter(ProviderAdapter):
         candidates: list[Path] = []
         seen: set[Path] = set()
         project_dir = self.projects_root / self._project_dir_name(repo_path)
+        for path in self._project_index_files(project_dir):
+            if path in seen or not path.exists():
+                continue
+            candidates.append(path)
+            seen.add(path)
+            if len(candidates) >= limit:
+                return candidates
         if project_dir.is_dir():
             for path in sorted(project_dir.glob("*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True):
+                if path.name == self.session_index_filename:
+                    continue
+                if path in seen:
+                    continue
                 candidates.append(path)
                 seen.add(path)
                 if len(candidates) >= limit:
                     return candidates
 
         for path in sorted(self.projects_root.rglob("*.jsonl"), key=lambda candidate: candidate.stat().st_mtime, reverse=True):
+            if path.name == self.session_index_filename:
+                continue
             if path in seen:
                 continue
             candidates.append(path)
             if len(candidates) >= limit:
                 break
         return candidates
+
+    def _project_index_files(self, project_dir: Path) -> list[Path]:
+        index_path = project_dir / self.session_index_filename
+        if not index_path.exists():
+            return []
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            return []
+
+        paths: list[Path] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            full_path = entry.get("fullPath")
+            if not isinstance(full_path, str) or not full_path.strip():
+                continue
+            candidate = Path(full_path).expanduser().resolve(strict=False)
+            if candidate.exists():
+                paths.append(candidate)
+        return paths
+
+    def _session_from_known_id(self, repo_path: Path, session_id: str) -> ProviderSession | None:
+        project_dir = self.projects_root / self._project_dir_name(repo_path)
+        direct_path = project_dir / f"{session_id}.jsonl"
+        if direct_path.exists():
+            return self._session_from_transcript(direct_path, repo_path)
+
+        for path in self._project_index_files(project_dir):
+            if path.stem != session_id:
+                continue
+            session = self._session_from_transcript(path, repo_path)
+            if session and session.session_id == session_id:
+                return session
+
+        for path in self._candidate_project_files(repo_path, limit=60):
+            if path.stem != session_id:
+                continue
+            session = self._session_from_transcript(path, repo_path)
+            if session and session.session_id == session_id:
+                return session
+        return None
 
     def _session_from_transcript(self, transcript_path: Path, repo_path: Path) -> ProviderSession | None:
         records = self._read_all_records(transcript_path)

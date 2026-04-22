@@ -9,7 +9,7 @@ from typing import Iterable
 
 from ..config import TurnmuxConfig, validate_repo_path
 from ..providers import ProviderRegistry
-from ..providers.base import ProviderSession, parse_timestamp
+from ..providers.base import ProviderSession, ProviderTranscriptEvent, parse_timestamp
 from ..providers.trust import ensure_provider_trust
 from ..runtime.approvals import detect_approval_request
 from ..runtime import tmux
@@ -27,13 +27,26 @@ class OutboundMessage:
     text: str
     markup_kind: str | None = None
     markup_has_deny: bool = False
+    binding_id: int | None = None
+    next_byte_offset: int | None = None
+    last_event_ts: str | None = None
+    last_message_hash: str | None = None
+    finalize_monitor_offset: bool = False
 
 
 class AppService:
-    def __init__(self, *, config: TurnmuxConfig, repository: StateRepository, providers: ProviderRegistry) -> None:
+    def __init__(
+        self,
+        *,
+        config: TurnmuxConfig,
+        repository: StateRepository,
+        providers: ProviderRegistry,
+        runtime_home: Path | None = None,
+    ) -> None:
         self.config = config
         self.repository = repository
         self.providers = providers
+        self.runtime_home = runtime_home.expanduser().resolve(strict=False) if runtime_home is not None else None
 
     def validate_repo(self, repo_path_text: str) -> Path:
         return validate_repo_path(Path(repo_path_text), self.config.allowed_roots)
@@ -81,7 +94,7 @@ class AppService:
 
         adapter = self.providers.get(provider)
         window_env = adapter.runtime_env()
-        ensure_provider_trust(provider, repo_path)
+        ensure_provider_trust(provider, repo_path, runtime_home=self.runtime_home)
         tmux.ensure_session(self.config.tmux_session_name)
         window = tmux.create_window(
             self.config.tmux_session_name,
@@ -123,6 +136,8 @@ class AppService:
             repo_path=repo_path,
             started_after=started_after,
             requested_session_id=requested_session_id,
+            tmux_session_name=binding.tmux_session_name,
+            tmux_window_id=binding.tmux_window_id,
         )
 
         if discovered:
@@ -149,6 +164,8 @@ class AppService:
         repo_path: Path,
         started_after: str,
         requested_session_id: str | None,
+        tmux_session_name: str | None,
+        tmux_window_id: str | None,
     ) -> ProviderSession | None:
         adapter = self.providers.get(provider)
         for _ in range(10):
@@ -156,13 +173,15 @@ class AppService:
                 repo_path,
                 started_after=started_after,
                 requested_session_id=requested_session_id,
+                tmux_session_name=tmux_session_name,
+                tmux_window_id=tmux_window_id,
             )
             if discovered:
                 return discovered
             await asyncio.sleep(0.5)
         return None
 
-    def _activate_binding(self, binding_id: int, session: ProviderSession) -> None:
+    def _activate_binding(self, binding_id: int, session: ProviderSession, *, initial_offset: int | None = None) -> None:
         self.repository.update_binding_session(
             binding_id,
             provider_session_id=session.session_id,
@@ -173,7 +192,7 @@ class AppService:
         if binding is None:
             raise RuntimeError("Binding disappeared during activation.")
         adapter = self.providers.get(binding.provider)
-        byte_offset = adapter.initial_monitor_offset(session)
+        byte_offset = adapter.initial_monitor_offset(session) if initial_offset is None else initial_offset
         self.repository.upsert_monitor_offset(binding_id, byte_offset=byte_offset)
         self.repository.delete_pending_launch(binding_id)
 
@@ -204,7 +223,7 @@ class AppService:
             raise RuntimeError("Binding has no tmux window.")
 
         adapter = self.providers.get(binding.provider)
-        ensure_provider_trust(binding.provider, binding.repo_path)
+        ensure_provider_trust(binding.provider, binding.repo_path, runtime_home=self.runtime_home)
         self.repository.upsert_monitor_offset(binding.id, byte_offset=0)
         started_after = utc_now_iso()
 
@@ -247,7 +266,7 @@ class AppService:
         )
         if not events:
             return "No history available yet."
-        return "\n\n".join(f"[{event.role}] {event.text}" for event in events)
+        return "\n\n".join(_format_history_event(event) for event in events)
 
     def resolve_pending_approval(self, binding: Binding, *, approve: bool) -> str:
         pending = self.repository.get_pending_approval(binding.id)
@@ -264,6 +283,20 @@ class AppService:
         self.repository.delete_pending_approval(binding.id)
         return "Approval sent." if approve else "Denial sent."
 
+    def mark_outbound_delivered(self, message: OutboundMessage) -> None:
+        if (
+            message.binding_id is None
+            or not message.finalize_monitor_offset
+            or message.next_byte_offset is None
+        ):
+            return
+        self.repository.upsert_monitor_offset(
+            message.binding_id,
+            byte_offset=message.next_byte_offset,
+            last_event_ts=message.last_event_ts,
+            last_message_hash=message.last_message_hash,
+        )
+
     def refresh_pending_and_active_bindings(self) -> list[OutboundMessage]:
         outbound: list[OutboundMessage] = []
         now = datetime.now(timezone.utc)
@@ -279,16 +312,21 @@ class AppService:
                 pending.repo_path,
                 started_after=pending.started_at,
                 requested_session_id=pending.requested_session_id,
+                tmux_session_name=binding.tmux_session_name,
+                tmux_window_id=binding.tmux_window_id,
             )
             if session:
-                self._activate_binding(binding.id, session)
-                outbound.append(
-                    OutboundMessage(
-                        chat_id=binding.chat_id,
-                        thread_id=binding.thread_id,
-                        text=f"Session is active: {binding.provider.value} {session.session_id}",
-                    )
-                )
+                # Fresh launches can emit output before discovery notices the
+                # transcript file. Start monitoring from byte 0 so the first
+                # progress/final messages are not dropped on activation.
+                initial_offset = None
+                if (
+                    pending.requested_session_id is None
+                    and binding.provider_session_id is None
+                    and binding.transcript_path is None
+                ):
+                    initial_offset = 0
+                self._activate_binding(binding.id, session, initial_offset=initial_offset)
                 continue
 
             deadline = parse_timestamp(pending.discovery_deadline_at)
@@ -353,20 +391,26 @@ class AppService:
                 offset,
                 session_id=binding.provider_session_id,
             )
-            if batch.new_offset != offset or batch.events:
+            if batch.events:
+                for index, event in enumerate(batch.events):
+                    outbound.append(
+                        OutboundMessage(
+                            chat_id=binding.chat_id,
+                            thread_id=binding.thread_id,
+                            text=_format_transcript_event_message(event),
+                            binding_id=binding.id,
+                            next_byte_offset=batch.new_offset,
+                            last_event_ts=batch.last_event_ts,
+                            last_message_hash=batch.last_message_hash,
+                            finalize_monitor_offset=index == len(batch.events) - 1,
+                        )
+                    )
+            elif batch.new_offset != offset:
                 self.repository.upsert_monitor_offset(
                     binding.id,
                     byte_offset=batch.new_offset,
                     last_event_ts=batch.last_event_ts,
                     last_message_hash=batch.last_message_hash,
-                )
-            for event in batch.events:
-                outbound.append(
-                    OutboundMessage(
-                        chat_id=binding.chat_id,
-                        thread_id=binding.thread_id,
-                        text=event.text,
-                    )
                 )
 
         return outbound
@@ -417,6 +461,16 @@ def encode_resume_candidates(candidates: Iterable[ProviderSession]) -> str:
 
 def encode_repo_candidates(paths: Iterable[Path]) -> str:
     return json.dumps([str(path) for path in paths], ensure_ascii=False)
+
+
+def _format_history_event(event: ProviderTranscriptEvent) -> str:
+    if not event.is_final:
+        return f"[progress] {event.text}"
+    return f"[{event.role}] {event.text}"
+
+
+def _format_transcript_event_message(event: ProviderTranscriptEvent) -> str:
+    return event.text
 
 
 def decode_repo_candidates(value: str | None) -> list[Path]:

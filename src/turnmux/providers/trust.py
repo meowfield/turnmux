@@ -6,13 +6,20 @@ from pathlib import Path
 import re
 import tomllib
 
+from .claude_session_hook import ensure_claude_session_start_hook, is_claude_session_start_hook_installed
 from ..state.models import ProviderName
 
 
-def ensure_provider_trust(provider: ProviderName, repo_path: Path) -> None:
+def ensure_provider_trust(
+    provider: ProviderName,
+    repo_path: Path,
+    *,
+    runtime_home: Path | None = None,
+) -> None:
     normalized_repo = repo_path.expanduser().resolve(strict=False)
     if provider == ProviderName.CLAUDE:
         ensure_claude_skip_dangerous_prompt()
+        ensure_claude_session_start_hook(runtime_home=runtime_home)
         ensure_claude_project_trusted(normalized_repo)
         return
     if provider == ProviderName.CODEX:
