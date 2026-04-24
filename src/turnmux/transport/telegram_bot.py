@@ -13,6 +13,7 @@ from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Upd
 from telegram.error import TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
+from ..attachments import AttachmentStore
 from ..audio_transcription import (
     AudioTranscriptionError,
     AudioTranscriptionNotConfiguredError,
@@ -23,7 +24,9 @@ from ..app.service import (
     AppService,
     decode_resume_candidates,
     encode_resume_candidates,
+    utc_now_iso,
 )
+from ..input_types import UserTurn
 from ..providers import ProviderRegistry
 from ..providers.base import ProviderSession, shorten_text
 from ..runtime.home import RuntimePaths
@@ -46,6 +49,9 @@ CONTROL_COMMANDS = {
 ONBOARDING_CALLBACK_PREFIX = "ob"
 APPROVAL_CALLBACK_PREFIX = "ap"
 REPO_BROWSER_PAGE_SIZE = 10
+TYPING_CHAT_ACTION = "typing"
+TYPING_ACTION_INTERVAL_SECONDS = 4.0
+TYPING_ACTION_MAX_AGE_SECONDS = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,11 +83,13 @@ class TurnmuxTelegramBot:
         self.available_providers = providers.available_providers()
         self.repository = repository
         self.runtime_paths = runtime_paths
+        self.attachment_store = AttachmentStore(runtime_paths.home) if runtime_paths is not None else None
         self.service = AppService(
             config=config,
             repository=repository,
             providers=providers,
             runtime_home=runtime_paths.home if runtime_paths is not None else None,
+            attachment_store=self.attachment_store,
         )
         self._monitor_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -91,6 +99,7 @@ class TurnmuxTelegramBot:
         self._runtime_note: str | None = None
         self._last_monitor_error_signature: str | None = None
         self._last_monitor_error_at = 0.0
+        self._typing_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -100,6 +109,16 @@ class TurnmuxTelegramBot:
         if self.runtime_paths is not None:
             self._heartbeat_writer = HeartbeatWriter(self.runtime_paths.heartbeat_path)
             self._heartbeat_writer.write(status="starting")
+        if self.attachment_store is not None:
+            live_topics = {
+                (binding.chat_id, binding.thread_id)
+                for binding in self.repository.list_bindings()
+            }
+            live_topics.update(
+                (state.chat_id, state.thread_id)
+                for state in self.repository.list_onboarding_states()
+            )
+            self.attachment_store.scrub_orphans(live_topics=live_topics)
 
         application = Application.builder().token(self.config.telegram_bot_token).build()
         self._register_handlers(application)
@@ -134,6 +153,7 @@ class TurnmuxTelegramBot:
                 self._heartbeat_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await self._heartbeat_task
+            await self._stop_all_typing_indicators()
             if self._heartbeat_writer:
                 self._heartbeat_writer.write(status="stopped")
             await close_transcription_client()
@@ -247,6 +267,8 @@ class TurnmuxTelegramBot:
         if not await self._ensure_allowed(update):
             return
         chat_id, thread_id = topic_key(update)
+        if self.attachment_store is not None:
+            self.attachment_store.clear_topic(chat_id, thread_id)
         self.repository.clear_onboarding_state(chat_id, thread_id)
         await self._reply(update, "Setup cancelled.")
 
@@ -362,50 +384,82 @@ class TurnmuxTelegramBot:
             await self._reply(update, "The transcription was empty. Try a clearer or shorter recording.")
             return
         await self._reply(update, _format_transcribed_audio_message(transcribed))
-        await self._route_incoming_text(update, transcribed, from_audio=True)
+        await self._route_incoming_turn(
+            update,
+            UserTurn(
+                text=transcribed,
+                source="telegram",
+                source_message_id=getattr(message, "message_id", None),
+                created_at=utc_now_iso(),
+            ),
+            from_audio=True,
+        )
 
     async def _handle_attachment(self, update: Update, message) -> None:
-        attachment_kind = _attachment_kind(message)
-        chat_id, thread_id = topic_key(update)
-        logger.info(
-            "Ignoring unsupported attachment type=%s chat_id=%s thread_id=%s",
-            attachment_kind,
-            chat_id,
-            thread_id,
-        )
-        await self._reply(
-            update,
-            f"Unsupported attachment type: {attachment_kind}. Send text, voice, or audio.",
-        )
+        if self.attachment_store is None:
+            await self._reply(update, "Attachment support needs runtime paths. Restart TurnMux normally and try again.")
+            return
+        try:
+            turn = await _build_attachment_turn(update, message, attachment_store=self.attachment_store)
+        except UnsupportedAttachmentError as exc:
+            attachment_kind = _attachment_kind(message)
+            chat_id, thread_id = topic_key(update)
+            logger.info(
+                "Ignoring unsupported attachment type=%s chat_id=%s thread_id=%s",
+                attachment_kind,
+                chat_id,
+                thread_id,
+            )
+            await self._reply(update, str(exc))
+            return
+        except Exception as exc:
+            logger.exception("Failed to store Telegram attachment")
+            await self._reply(update, f"Failed to store attachment: {exc}")
+            return
+        await self._route_incoming_turn(update, turn)
 
     async def _route_incoming_text(self, update: Update, raw_text: str, *, from_audio: bool = False) -> None:
         text = raw_text.strip()
         if not text:
             return
+        await self._route_incoming_turn(
+            update,
+            UserTurn(text=text, source="telegram", created_at=utc_now_iso()),
+            from_audio=from_audio,
+        )
+
+    async def _route_incoming_turn(self, update: Update, turn: UserTurn, *, from_audio: bool = False) -> None:
+        if not turn.has_content():
+            return
 
         chat_id, thread_id = topic_key(update)
         onboarding = self.repository.get_onboarding_state(chat_id, thread_id)
         if onboarding:
+            if turn.attachments:
+                await self._reply(update, "Finish setup first or use /cancel, then send attachments again.")
+                return
+            text = turn.normalized_text()
+            if text is None:
+                return
             await self._advance_onboarding(update, text, onboarding.mode)
             return
 
         binding = self.repository.get_binding(chat_id, thread_id)
         if not binding:
-            seed_text = text
-            if _is_forum_lobby(update) and seed_text:
-                await self._maybe_redirect_new_session_to_topic(update, mode="fresh", seed_text=seed_text)
+            if _is_forum_lobby(update):
+                await self._maybe_redirect_new_session_to_topic(update, mode="fresh", pending_turn=turn)
                 return
-            if _is_named_topic(update) and seed_text:
+            if _is_named_topic(update):
                 self.repository.save_onboarding_state(
                     chat_id=chat_id,
                     thread_id=thread_id,
                     step=OnboardingStep.CHOOSE_PROVIDER,
                     mode="fresh",
-                    pending_user_text=_encode_pending_state(seed_text=seed_text),
+                    pending_user_text=_encode_pending_state(pending_turn=turn),
                 )
                 await self._reply(
                     update,
-                    _format_provider_prompt(seed_text),
+                    _format_provider_prompt(turn),
                     reply_markup=_build_provider_keyboard(self.available_providers),
                 )
                 return
@@ -416,13 +470,22 @@ class TurnmuxTelegramBot:
             return
 
         try:
-            self.service.send_user_text(binding, text)
+            self.service.send_user_turn(binding, turn)
         except Exception as exc:
-            logger.exception("Failed to forward user text")
-            await self._reply(update, f"Failed to send text to the live session: {exc}")
+            logger.exception("Failed to forward user turn")
+            await self._reply(update, f"Failed to send message to the live session: {exc}")
             return
-        if _should_send_progress_ack(text, from_audio=from_audio):
+
+        text = turn.normalized_text()
+        if turn.attachments:
+            await self._reply(update, _format_attachment_ack(binding.provider, turn))
+            self._start_typing_indicator_for_update(update)
+            return
+        if text and _should_send_progress_ack(text, from_audio=from_audio):
             await self._reply(update, _format_progress_ack(binding.provider))
+            self._start_typing_indicator_for_update(update)
+            return
+        self._start_typing_indicator_for_update(update)
 
     async def _handle_onboarding_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ensure_allowed(update):
@@ -688,7 +751,7 @@ class TurnmuxTelegramBot:
                 provider=onboarding.provider,
                 repo_path=onboarding.repo_path,
                 mode="resume",
-                pending_user_text=_encode_pending_state(seed_text=_extract_seed_text(onboarding.pending_user_text)),
+                pending_user_text=_encode_pending_state(pending_turn=_extract_pending_turn(onboarding.pending_user_text)),
             )
             await self._present_resume_candidates(update, onboarding.provider, onboarding.repo_path)
             return
@@ -745,8 +808,9 @@ class TurnmuxTelegramBot:
         if recent_repos is None:
             existing_state = _decode_repo_browser_state(onboarding.pending_user_text if onboarding else None)
             recent_repos = list(existing_state.recent_repos) or self.service.suggest_repos(limit=6)
+        pending_turn = _extract_pending_turn(onboarding.pending_user_text if onboarding else None)
         if seed_text is None:
-            seed_text = _extract_seed_text(onboarding.pending_user_text if onboarding else None)
+            seed_text = pending_turn.normalized_text() if pending_turn else None
         browser_state = _make_repo_browser_state(
             recent_repos=recent_repos,
             allowed_roots=self.config.allowed_roots,
@@ -759,7 +823,16 @@ class TurnmuxTelegramBot:
             step=OnboardingStep.CHOOSE_REPO,
             provider=provider,
             mode=mode,
-            pending_user_text=_encode_pending_state(seed_text=seed_text, repo_browser_state=browser_state),
+            pending_user_text=_encode_pending_state(
+                pending_turn=UserTurn(
+                    text=seed_text,
+                    attachments=pending_turn.attachments if pending_turn else (),
+                    source=pending_turn.source if pending_turn else "telegram",
+                    source_message_id=pending_turn.source_message_id if pending_turn else None,
+                    created_at=pending_turn.created_at if pending_turn else None,
+                ) if (seed_text or (pending_turn and pending_turn.attachments)) else None,
+                repo_browser_state=browser_state,
+            ),
         )
         await self._reply(
             update,
@@ -788,7 +861,7 @@ class TurnmuxTelegramBot:
                 provider=provider,
                 repo_path=repo_path,
                 mode="fresh",
-                pending_user_text=_encode_pending_state(seed_text=_extract_seed_text(onboarding.pending_user_text if onboarding else None)),
+                pending_user_text=_encode_pending_state(pending_turn=_extract_pending_turn(onboarding.pending_user_text if onboarding else None)),
             )
             await self._reply(
                 update,
@@ -806,7 +879,7 @@ class TurnmuxTelegramBot:
             provider=provider,
             repo_path=repo_path,
             mode="resume",
-            pending_user_text=_encode_pending_state(seed_text=_extract_seed_text(onboarding.pending_user_text if onboarding else None)),
+            pending_user_text=_encode_pending_state(pending_turn=_extract_pending_turn(onboarding.pending_user_text if onboarding else None)),
             resume_candidates_json=encode_resume_candidates(candidates),
         )
         await self._reply(
@@ -847,7 +920,7 @@ class TurnmuxTelegramBot:
             provider=provider,
             repo_path=repo_path,
             mode=preferred_mode,
-            pending_user_text=_encode_pending_state(seed_text=_extract_seed_text(onboarding.pending_user_text if onboarding else None)),
+            pending_user_text=_encode_pending_state(pending_turn=_extract_pending_turn(onboarding.pending_user_text if onboarding else None)),
             resume_candidates_json=encode_resume_candidates(candidates),
         )
         await self._reply(
@@ -870,7 +943,7 @@ class TurnmuxTelegramBot:
             return
         chat_id, thread_id = topic_key(update)
         onboarding = self.repository.get_onboarding_state(chat_id, thread_id)
-        seed_text = _extract_seed_text(onboarding.pending_user_text if onboarding else None)
+        pending_turn = _extract_pending_turn(onboarding.pending_user_text if onboarding else None)
         try:
             binding = await self.service.launch_binding(
                 chat_id=chat_id,
@@ -885,17 +958,19 @@ class TurnmuxTelegramBot:
             await self._reply(update, f"Failed to launch {provider.value}: {exc}")
             return
         auto_sent = False
-        if seed_text and mode == "fresh":
+        if pending_turn and mode == "fresh":
             try:
-                self.service.send_user_text(binding, seed_text)
+                self.service.send_user_turn(binding, pending_turn)
                 auto_sent = True
             except Exception:
                 logger.exception("Failed to auto-send saved first message")
         self.repository.clear_onboarding_state(chat_id, thread_id)
+        if not auto_sent and self.attachment_store is not None:
+            self.attachment_store.clear_topic(chat_id, thread_id)
         repo_label = _repo_button_label(repo_path)
         status_note = f"Started {provider.value} for `{repo_label}`."
         if auto_sent:
-            status_note += f"\n{_format_sent_seed_message(provider, seed_text or '')}"
+            status_note += f"\n{_format_sent_turn_message(provider, pending_turn)}"
         elif mode == "fresh" and binding.status == BindingStatus.PENDING_START:
             status_note += "\nSend the first message in this topic to start the session."
         elif binding.status == BindingStatus.PENDING_START:
@@ -912,15 +987,7 @@ class TurnmuxTelegramBot:
         while True:
             try:
                 outbound = self.service.refresh_pending_and_active_bindings()
-                for message in outbound:
-                    await send_thread_message(
-                        application,
-                        chat_id=message.chat_id,
-                        thread_id=message.thread_id,
-                        text=message.text,
-                        reply_markup=_build_approval_keyboard(has_deny=message.markup_has_deny) if message.markup_kind == "approval" else None,
-                    )
-                    self.service.mark_outbound_delivered(message)
+                await self._deliver_outbound_messages(application, outbound)
                 self._set_runtime_health("running")
             except asyncio.CancelledError:
                 raise
@@ -962,6 +1029,82 @@ class TurnmuxTelegramBot:
         self._runtime_status = status
         self._runtime_note = note
 
+    async def _deliver_outbound_messages(self, application: Application, outbound: Iterable) -> None:
+        for message in outbound:
+            await self._stop_typing_indicator(message.chat_id, message.thread_id)
+            await send_thread_message(
+                application,
+                chat_id=message.chat_id,
+                thread_id=message.thread_id,
+                text=message.text,
+                reply_markup=_build_approval_keyboard(has_deny=message.markup_has_deny) if message.markup_kind == "approval" else None,
+            )
+            self.service.mark_outbound_delivered(message)
+
+    def _start_typing_indicator_for_update(self, update: Update) -> None:
+        message = update.effective_message
+        if message is None:
+            return
+        get_bot = getattr(message, "get_bot", None)
+        if not callable(get_bot):
+            return
+        chat_id, thread_id = topic_key(update)
+        self._start_typing_indicator(get_bot(), chat_id=chat_id, thread_id=thread_id)
+
+    def _start_typing_indicator(self, bot, *, chat_id: int, thread_id: int) -> None:
+        key = (chat_id, thread_id)
+        existing = self._typing_tasks.pop(key, None)
+        if existing is not None:
+            existing.cancel()
+        self._typing_tasks[key] = asyncio.create_task(
+            self._typing_indicator_loop(bot, chat_id=chat_id, thread_id=thread_id),
+            name=f"turnmux-typing-{chat_id}-{thread_id}",
+        )
+
+    async def _stop_typing_indicator(self, chat_id: int, thread_id: int) -> None:
+        task = self._typing_tasks.pop((chat_id, thread_id), None)
+        if task is None:
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _stop_all_typing_indicators(self) -> None:
+        tasks = list(self._typing_tasks.values())
+        self._typing_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def _typing_indicator_loop(self, bot, *, chat_id: int, thread_id: int) -> None:
+        key = (chat_id, thread_id)
+        current_task = asyncio.current_task()
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        try:
+            while True:
+                await bot.send_chat_action(
+                    chat_id=chat_id,
+                    message_thread_id=thread_id or None,
+                    action=TYPING_CHAT_ACTION,
+                )
+                elapsed = loop.time() - started_at
+                remaining = TYPING_ACTION_MAX_AGE_SECONDS - elapsed
+                if remaining <= 0:
+                    return
+                await asyncio.sleep(min(TYPING_ACTION_INTERVAL_SECONDS, remaining))
+        except asyncio.CancelledError:
+            raise
+        except TelegramError:
+            logger.exception("Failed to send Telegram typing action chat_id=%s thread_id=%s", chat_id, thread_id)
+        except Exception:
+            logger.exception("Unexpected error while sending Telegram typing action chat_id=%s thread_id=%s", chat_id, thread_id)
+        finally:
+            if self._typing_tasks.get(key) is current_task:
+                self._typing_tasks.pop(key, None)
+
     async def _ensure_allowed(self, update: Update) -> bool:
         user = update.effective_user
         if user is None or getattr(user, "is_bot", False):
@@ -971,7 +1114,7 @@ class TurnmuxTelegramBot:
         await self._reply(update, "You are not allowed to use this TurnMux bot.")
         return False
 
-    async def _maybe_redirect_new_session_to_topic(self, update: Update, *, mode: str, seed_text: str | None = None) -> bool:
+    async def _maybe_redirect_new_session_to_topic(self, update: Update, *, mode: str, pending_turn: UserTurn | None = None) -> bool:
         if not _is_forum_lobby(update):
             return False
 
@@ -1000,17 +1143,17 @@ class TurnmuxTelegramBot:
             thread_id=forum_topic.message_thread_id,
             step=OnboardingStep.CHOOSE_PROVIDER,
             mode=mode,
-            pending_user_text=_encode_pending_state(seed_text=seed_text),
+            pending_user_text=_encode_pending_state(pending_turn=pending_turn),
         )
         await send_thread_message(
             message.get_bot(),
             chat_id=chat.id,
             thread_id=forum_topic.message_thread_id,
-            text=_format_provider_prompt(seed_text),
+            text=_format_provider_prompt(pending_turn),
             reply_markup=_build_provider_keyboard(self.available_providers),
         )
         followup = f"Created topic `{topic_name}`. Continue there."
-        if seed_text:
+        if pending_turn and pending_turn.has_content():
             followup = f"Created topic `{topic_name}` from your message. Continue there."
         await self._reply(update, followup)
         return True
@@ -1145,6 +1288,10 @@ async def send_thread_message(bot_or_application, *, chat_id: int, thread_id: in
         reply_markup = None
 
 
+class UnsupportedAttachmentError(RuntimeError):
+    pass
+
+
 def split_text(text: str, *, limit: int = 3500) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -1199,6 +1346,60 @@ async def _download_audio_payload(message) -> tuple[str, str, bytes]:
     raise ValueError("Message does not contain a supported audio attachment.")
 
 
+async def _build_attachment_turn(update: Update, message, *, attachment_store: AttachmentStore) -> UserTurn:
+    caption = getattr(message, "caption", None)
+    attachments = []
+    chat_id, thread_id = topic_key(update)
+    source_message_id = getattr(message, "message_id", None)
+
+    if getattr(message, "photo", None):
+        largest_photo = message.photo[-1]
+        telegram_file = await largest_photo.get_file()
+        payload = bytes(await telegram_file.download_as_bytearray())
+        attachment = attachment_store.store_attachment(
+            chat_id,
+            thread_id,
+            original_name="photo.jpg",
+            mime_type="image/jpeg",
+            payload=payload,
+            source_message_id=source_message_id,
+            source_kind="photo",
+            metadata={
+                "width": getattr(largest_photo, "width", None),
+                "height": getattr(largest_photo, "height", None),
+            },
+        )
+        attachments.append(attachment)
+    elif getattr(message, "document", None) is not None:
+        document = message.document
+        telegram_file = await document.get_file()
+        payload = bytes(await telegram_file.download_as_bytearray())
+        attachment = attachment_store.store_attachment(
+            chat_id,
+            thread_id,
+            original_name=getattr(document, "file_name", None),
+            mime_type=getattr(document, "mime_type", None),
+            payload=payload,
+            source_message_id=source_message_id,
+            source_kind="document",
+            metadata={},
+        )
+        attachments.append(attachment)
+    else:
+        attachment_kind = _attachment_kind(message)
+        raise UnsupportedAttachmentError(
+            f"Unsupported attachment type: {attachment_kind}. Send text, voice, audio, photos, or text/image documents."
+        )
+
+    return UserTurn(
+        text=caption if isinstance(caption, str) else None,
+        attachments=tuple(attachments),
+        source="telegram",
+        source_message_id=source_message_id,
+        created_at=utc_now_iso(),
+    )
+
+
 def _attachment_kind(message) -> str:
     for field_name in (
         "voice",
@@ -1221,23 +1422,38 @@ def _attachment_kind(message) -> str:
     return "attachment"
 
 
-def _format_provider_prompt(seed_text: str | None) -> str:
-    if not seed_text:
+def _format_provider_prompt(turn: UserTurn | None) -> str:
+    if turn is None or not turn.has_content():
         return "Choose a provider for this topic."
-    excerpt = _seed_text_excerpt(seed_text, limit=160)
-    return (
-        f'Saved first message: "{excerpt}"\n\n'
-        "Choose a provider for this topic.\n"
-        "It will be sent after setup."
-    )
+    lines: list[str] = []
+    text = turn.normalized_text()
+    if text:
+        lines.append(f'Saved first message: "{_seed_text_excerpt(text, limit=160)}"')
+    else:
+        lines.append("Saved first message with attachments.")
+    if turn.attachments:
+        lines.append(f"Saved attachments: {len(turn.attachments)}")
+    lines.append("")
+    lines.append("Choose a provider for this topic.")
+    lines.append("It will be sent after setup.")
+    return "\n".join(lines)
 
 
 def _seed_text_excerpt(seed_text: str, *, limit: int = 160) -> str:
     return shorten_text(" ".join(seed_text.split()), limit=limit)
 
 
-def _format_sent_seed_message(provider: ProviderName, seed_text: str) -> str:
-    return f'Sent to {provider.value}: "{_seed_text_excerpt(seed_text, limit=200)}"'
+def _format_sent_turn_message(provider: ProviderName, turn: UserTurn | None) -> str:
+    if turn is None:
+        return f"Sent to {provider.value}."
+    text = turn.normalized_text()
+    if text and turn.attachments:
+        return f'Sent to {provider.value}: "{_seed_text_excerpt(text, limit=200)}" with {len(turn.attachments)} attachment(s).'
+    if text:
+        return f'Sent to {provider.value}: "{_seed_text_excerpt(text, limit=200)}"'
+    if turn.attachments:
+        return f"Sent to {provider.value} with {len(turn.attachments)} attachment(s)."
+    return f"Sent to {provider.value}."
 
 
 def _format_transcribed_audio_message(text: str) -> str:
@@ -1254,6 +1470,13 @@ def _should_send_progress_ack(text: str, *, from_audio: bool) -> bool:
 
 def _format_progress_ack(provider: ProviderName) -> str:
     return f"Sent to {provider.value}. I will post progress updates here."
+
+
+def _format_attachment_ack(provider: ProviderName, turn: UserTurn) -> str:
+    count = len(turn.attachments)
+    if turn.normalized_text():
+        return f"Sent to {provider.value} with {count} attachment(s). I will post progress updates here."
+    return f"Sent {count} attachment(s) to {provider.value}. I will post progress updates here."
 
 
 def _has_user_attachment(message) -> bool:
@@ -1517,11 +1740,18 @@ def _make_repo_browser_state(
     )
 
 
-def _encode_pending_state(*, seed_text: str | None = None, repo_browser_state: RepoBrowserState | None = None) -> str | None:
+def _encode_pending_state(*, seed_text: str | None = None, repo_browser_state: RepoBrowserState | None = None, pending_turn: UserTurn | None = None) -> str | None:
     payload: dict[str, object] = {}
     # Onboarding keeps one persisted blob so button callbacks and free-text
     # replies can share the same seed message and repo-browser snapshot.
-    if seed_text:
+    normalized_turn = pending_turn
+    if normalized_turn is None and seed_text:
+        normalized_turn = UserTurn(text=seed_text)
+    if normalized_turn is not None and normalized_turn.has_content():
+        payload["turn"] = normalized_turn.to_payload()
+        if normalized_turn.normalized_text():
+            payload["seed_text"] = normalized_turn.normalized_text()
+    elif seed_text:
         payload["seed_text"] = seed_text
     if repo_browser_state is not None:
         payload["repo_browser"] = _repo_browser_to_payload(repo_browser_state)
@@ -1550,6 +1780,9 @@ def _decode_repo_browser_state(value: str | None) -> RepoBrowserState:
 
 
 def _extract_seed_text(value: str | None) -> str | None:
+    pending_turn = _extract_pending_turn(value)
+    if pending_turn is not None:
+        return pending_turn.normalized_text()
     if not value:
         return None
     try:
@@ -1561,6 +1794,26 @@ def _extract_seed_text(value: str | None) -> str | None:
     seed_text = payload.get("seed_text")
     if isinstance(seed_text, str) and seed_text.strip():
         return seed_text
+    return None
+
+
+def _extract_pending_turn(value: str | None) -> UserTurn | None:
+    if not value:
+        return None
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        normalized = value.strip()
+        return UserTurn(text=normalized) if normalized else None
+    if not isinstance(payload, dict):
+        return None
+    turn_payload = payload.get("turn")
+    turn = UserTurn.from_payload(turn_payload)
+    if turn is not None:
+        return turn
+    seed_text = payload.get("seed_text")
+    if isinstance(seed_text, str) and seed_text.strip():
+        return UserTurn(text=seed_text.strip())
     return None
 
 

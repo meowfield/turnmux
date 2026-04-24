@@ -18,6 +18,7 @@ from .runtime.lifecycle import read_heartbeat
 DEFAULT_SERVICE_LABEL = "io.turnmux.bot"
 HEARTBEAT_STALE_AFTER_SECONDS = 90.0
 _SEVERITY_ORDER = {"ok": 0, "warn": 1, "error": 2}
+SERVICE_ENV_PASSTHROUGH = ("TURNMUX_TMUX_BINARY",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +83,16 @@ def build_launch_agent_spec(
 
 
 def render_launch_agent_plist(spec: LaunchAgentSpec) -> bytes:
+    existing_environment = _read_launch_agent_environment(spec.plist_path)
+    environment = {
+        "PATH": build_runtime_path(),
+        "PYTHONUNBUFFERED": "1",
+    }
+    for name in SERVICE_ENV_PASSTHROUGH:
+        value = os.environ.get(name) or existing_environment.get(name)
+        if value:
+            environment[name] = value
+
     payload = {
         "Label": spec.label,
         "ProgramArguments": list(spec.program_arguments),
@@ -91,12 +102,21 @@ def render_launch_agent_plist(spec: LaunchAgentSpec) -> bytes:
         "ProcessType": "Background",
         "StandardOutPath": str(spec.stdout_path),
         "StandardErrorPath": str(spec.stderr_path),
-        "EnvironmentVariables": {
-            "PATH": build_runtime_path(),
-            "PYTHONUNBUFFERED": "1",
-        },
+        "EnvironmentVariables": environment,
     }
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
+
+
+def _read_launch_agent_environment(plist_path: Path) -> dict[str, str]:
+    try:
+        payload = plistlib.loads(plist_path.read_bytes())
+    except (FileNotFoundError, plistlib.InvalidFileException, OSError):
+        return {}
+
+    environment = payload.get("EnvironmentVariables")
+    if not isinstance(environment, dict):
+        return {}
+    return {str(key): value for key, value in environment.items() if isinstance(value, str)}
 
 
 def install_launch_agent(

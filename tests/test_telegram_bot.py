@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
 
+from turnmux.app.service import OutboundMessage
 from turnmux.config import TurnmuxConfig
 from turnmux.providers import ProviderRegistry
 from turnmux.state.repository import StateRepository
@@ -19,6 +21,7 @@ from turnmux.transport.telegram_bot import (
     _decode_repo_browser_state,
     _encode_repo_browser_state,
     _encode_pending_state,
+    _extract_pending_turn,
     _extract_seed_text,
     _format_topic_name,
     _format_topic_setup_name,
@@ -30,6 +33,7 @@ from turnmux.transport.telegram_bot import (
     topic_key,
     TurnmuxTelegramBot,
 )
+from turnmux.runtime.home import initialize_runtime_home
 from turnmux.providers.base import ProviderSession
 from turnmux.state.db import bootstrap_database
 
@@ -275,6 +279,104 @@ class TelegramBotApprovalTests(unittest.IsolatedAsyncioTestCase):
             bot._reply.assert_awaited_once_with(update, "Approval sent.")
 
 
+class TelegramTypingIndicatorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_route_incoming_text_starts_typing_indicator_for_active_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            bootstrap_database(root / "state.db")
+            config = TurnmuxConfig(
+                telegram_bot_token="token",
+                allowed_user_ids=(1,),
+                allowed_roots=(root,),
+                tmux_session_name="turnmux",
+                claude_command=("claude",),
+                codex_command=("codex",),
+                opencode_command=None,
+                opencode_model=None,
+                config_path=root / "config.toml",
+                relay_claude_thinking=False,
+            )
+            repository = StateRepository(root / "state.db")
+            repository.save_binding(
+                chat_id=-100123,
+                thread_id=42,
+                provider=ProviderName.CODEX,
+                repo_path=root,
+                tmux_session_name="turnmux",
+                tmux_window_id="@9",
+                tmux_window_name="codex:tmp",
+                provider_session_id="session-123",
+                transcript_path=root / "transcript.jsonl",
+                status=BindingStatus.ACTIVE,
+            )
+            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config))
+            bot._reply = AsyncMock()  # type: ignore[method-assign]
+            bot.service.send_user_turn = Mock()  # type: ignore[method-assign]
+
+            telegram_client = SimpleNamespace(send_chat_action=AsyncMock())
+            update = SimpleNamespace(
+                effective_user=SimpleNamespace(id=1),
+                effective_chat=SimpleNamespace(id=-100123, type="supergroup", is_forum=True),
+                effective_message=SimpleNamespace(
+                    message_thread_id=42,
+                    text=None,
+                    get_bot=lambda: telegram_client,
+                ),
+            )
+
+            await bot._route_incoming_text(update, "hello")
+            await asyncio.sleep(0)
+
+            bot.service.send_user_turn.assert_called_once()
+            telegram_client.send_chat_action.assert_awaited_once_with(
+                chat_id=-100123,
+                message_thread_id=42,
+                action="typing",
+            )
+            await bot._stop_all_typing_indicators()
+
+    async def test_deliver_outbound_messages_stops_typing_indicator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            bootstrap_database(root / "state.db")
+            config = TurnmuxConfig(
+                telegram_bot_token="token",
+                allowed_user_ids=(1,),
+                allowed_roots=(root,),
+                tmux_session_name="turnmux",
+                claude_command=("claude",),
+                codex_command=("codex",),
+                opencode_command=None,
+                opencode_model=None,
+                config_path=root / "config.toml",
+                relay_claude_thinking=False,
+            )
+            repository = StateRepository(root / "state.db")
+            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config))
+            bot.service.mark_outbound_delivered = Mock()  # type: ignore[method-assign]
+
+            telegram_client = SimpleNamespace(
+                send_chat_action=AsyncMock(),
+                send_message=AsyncMock(),
+            )
+            bot._start_typing_indicator(telegram_client, chat_id=-100123, thread_id=42)
+            await asyncio.sleep(0)
+
+            await bot._deliver_outbound_messages(
+                SimpleNamespace(bot=telegram_client),
+                [OutboundMessage(chat_id=-100123, thread_id=42, text="done")],
+            )
+
+            self.assertNotIn((-100123, 42), bot._typing_tasks)
+            telegram_client.send_message.assert_awaited_once_with(
+                chat_id=-100123,
+                text="done",
+                message_thread_id=42,
+                reply_markup=None,
+            )
+            bot.service.mark_outbound_delivered.assert_called_once()
+
+
 class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_audio_transcribes_voice_and_routes_like_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -296,7 +398,7 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
             repository = StateRepository(root / "state.db")
             bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config))
             bot._ensure_allowed = AsyncMock(return_value=True)  # type: ignore[method-assign]
-            bot._route_incoming_text = AsyncMock()  # type: ignore[method-assign]
+            bot._route_incoming_turn = AsyncMock()  # type: ignore[method-assign]
             bot._reply = AsyncMock()  # type: ignore[method-assign]
 
             telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b"ogg-data")))
@@ -314,10 +416,13 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
                 await bot._handle_message(update, None)
 
             transcribe.assert_awaited_once()
-            bot._route_incoming_text.assert_awaited_once_with(update, "hello from voice", from_audio=True)
+            bot._route_incoming_turn.assert_awaited_once()
+            routed_turn = bot._route_incoming_turn.await_args.args[1]
+            self.assertEqual(routed_turn.normalized_text(), "hello from voice")
+            self.assertEqual(bot._route_incoming_turn.await_args.kwargs, {"from_audio": True})
             bot._reply.assert_awaited_once_with(update, "Transcribed audio:\nhello from voice")
 
-    async def test_handle_attachment_replies_for_unsupported_media(self) -> None:
+    async def test_handle_photo_starts_setup_and_persists_tmp_attachment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             bootstrap_database(root / "state.db")
@@ -334,22 +439,47 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
                 openai_api_key="sk-test",
             )
             repository = StateRepository(root / "state.db")
-            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config))
+            runtime_paths = initialize_runtime_home(root / ".turnmux")
+            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config), runtime_paths=runtime_paths)
             bot._ensure_allowed = AsyncMock(return_value=True)  # type: ignore[method-assign]
             bot._reply = AsyncMock()  # type: ignore[method-assign]
+            telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b"fake-jpeg-data")))
+            photo = SimpleNamespace(
+                get_file=AsyncMock(return_value=telegram_file),
+                width=800,
+                height=600,
+            )
 
             update = SimpleNamespace(
                 effective_user=SimpleNamespace(id=1),
                 effective_chat=SimpleNamespace(id=-100123, type="supergroup", is_forum=True),
-                effective_message=SimpleNamespace(message_thread_id=42, text=None, photo=[object()], voice=None, audio=None, video_note=None),
+                effective_message=SimpleNamespace(
+                    message_thread_id=42,
+                    message_id=99,
+                    text=None,
+                    caption="inspect this screenshot",
+                    photo=[photo],
+                    voice=None,
+                    audio=None,
+                    video_note=None,
+                ),
             )
 
             await bot._handle_message(update, None)
 
-            bot._reply.assert_awaited_once_with(
-                update,
-                "Unsupported attachment type: photo. Send text, voice, or audio.",
-            )
+            onboarding = repository.get_onboarding_state(-100123, 42)
+            self.assertIsNotNone(onboarding)
+            assert onboarding is not None
+            pending_turn = _extract_pending_turn(onboarding.pending_user_text)
+            self.assertIsNotNone(pending_turn)
+            assert pending_turn is not None
+            self.assertEqual(pending_turn.normalized_text(), "inspect this screenshot")
+            self.assertEqual(len(pending_turn.attachments), 1)
+            self.assertTrue(pending_turn.attachments[0].local_path.exists())
+            reply_text = bot._reply.await_args.args[1]
+            self.assertIn('Saved first message: "inspect this screenshot"', reply_text)
+            self.assertIn("Saved attachments: 1", reply_text)
+            self.assertIn("Choose a provider for this topic.", reply_text)
 
     async def test_handle_message_ignores_forum_topic_service_updates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -368,7 +498,8 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
                 openai_api_key="sk-test",
             )
             repository = StateRepository(root / "state.db")
-            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config))
+            runtime_paths = initialize_runtime_home(root / ".turnmux")
+            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config), runtime_paths=runtime_paths)
             bot._ensure_allowed = AsyncMock(return_value=True)  # type: ignore[method-assign]
             bot._reply = AsyncMock()  # type: ignore[method-assign]
             bot._route_incoming_text = AsyncMock()  # type: ignore[method-assign]
@@ -411,7 +542,8 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
                 openai_api_key="sk-test",
             )
             repository = StateRepository(root / "state.db")
-            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config))
+            runtime_paths = initialize_runtime_home(root / ".turnmux")
+            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config), runtime_paths=runtime_paths)
             bot._ensure_allowed = AsyncMock(return_value=True)  # type: ignore[method-assign]
             bot._reply = AsyncMock()  # type: ignore[method-assign]
 
@@ -432,7 +564,78 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
 
             bot._reply.assert_awaited_once_with(
                 update,
-                "Unsupported attachment type: contact. Send text, voice, or audio.",
+                "Unsupported attachment type: contact. Send text, voice, audio, photos, or text/image documents.",
+            )
+
+    async def test_handle_text_document_for_active_binding_sends_structured_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            repo_path = root / "repo"
+            repo_path.mkdir()
+            (repo_path / ".git").mkdir()
+            runtime_paths = initialize_runtime_home(root / ".turnmux")
+            bootstrap_database(root / "state.db")
+            config = TurnmuxConfig(
+                telegram_bot_token="token",
+                allowed_user_ids=(1,),
+                allowed_roots=(root,),
+                tmux_session_name="turnmux",
+                claude_command=("claude",),
+                codex_command=("codex",),
+                opencode_command=None,
+                opencode_model=None,
+                config_path=root / "config.toml",
+                openai_api_key="sk-test",
+            )
+            repository = StateRepository(root / "state.db")
+            binding = repository.save_binding(
+                chat_id=-100123,
+                thread_id=42,
+                provider=ProviderName.CODEX,
+                repo_path=repo_path,
+                tmux_session_name="turnmux",
+                tmux_window_id="@1",
+                tmux_window_name="codex:repo",
+                status=BindingStatus.ACTIVE,
+            )
+            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config), runtime_paths=runtime_paths)
+            bot._ensure_allowed = AsyncMock(return_value=True)  # type: ignore[method-assign]
+            bot._reply = AsyncMock()  # type: ignore[method-assign]
+            bot.service.send_user_turn = Mock()  # type: ignore[method-assign]
+
+            telegram_file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b"hello from document")))
+            document = SimpleNamespace(
+                get_file=AsyncMock(return_value=telegram_file),
+                file_name="notes.txt",
+                mime_type="text/plain",
+            )
+            update = SimpleNamespace(
+                effective_user=SimpleNamespace(id=1),
+                effective_chat=SimpleNamespace(id=-100123, type="supergroup", is_forum=True),
+                effective_message=SimpleNamespace(
+                    message_thread_id=42,
+                    message_id=101,
+                    text=None,
+                    caption="check this file",
+                    document=document,
+                    voice=None,
+                    audio=None,
+                    video_note=None,
+                ),
+            )
+
+            await bot._handle_message(update, None)
+
+            bot.service.send_user_turn.assert_called_once()
+            sent_binding, sent_turn = bot.service.send_user_turn.call_args.args
+            self.assertEqual(sent_binding.id, binding.id)
+            self.assertEqual(sent_turn.normalized_text(), "check this file")
+            self.assertEqual(len(sent_turn.attachments), 1)
+            self.assertEqual(sent_turn.attachments[0].media_class.value, "text_document")
+            self.assertTrue(sent_turn.attachments[0].derived_text_path and sent_turn.attachments[0].derived_text_path.exists())
+            bot._reply.assert_awaited_once_with(
+                update,
+                "Sent to codex with 1 attachment(s). I will post progress updates here.",
             )
 
     async def test_handle_message_ignores_bot_authored_updates_without_unauthorized_reply(self) -> None:
@@ -648,7 +851,7 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
                 status=BindingStatus.ACTIVE,
             )
             service = Mock()
-            service.send_user_text = Mock()
+            service.send_user_turn = Mock()
             bot.service = service
 
             update = SimpleNamespace(
@@ -659,7 +862,10 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
 
             await bot._route_incoming_text(update, "hello from voice", from_audio=True)
 
-            service.send_user_text.assert_called_once_with(binding, "hello from voice")
+            service.send_user_turn.assert_called_once()
+            sent_binding, sent_turn = service.send_user_turn.call_args.args
+            self.assertEqual(sent_binding.id, binding.id)
+            self.assertEqual(sent_turn.normalized_text(), "hello from voice")
             self.assertEqual(
                 [call.args[1] for call in bot._reply.await_args_list],
                 ["Sent to codex. I will post progress updates here."],
@@ -698,7 +904,7 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
                 status=BindingStatus.ACTIVE,
             )
             service = Mock()
-            service.send_user_text = Mock()
+            service.send_user_turn = Mock()
             bot.service = service
 
             update = SimpleNamespace(
@@ -709,7 +915,10 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
 
             await bot._route_incoming_text(update, "x" * 260)
 
-            service.send_user_text.assert_called_once_with(binding, "x" * 260)
+            service.send_user_turn.assert_called_once()
+            sent_binding, sent_turn = service.send_user_turn.call_args.args
+            self.assertEqual(sent_binding.id, binding.id)
+            self.assertEqual(sent_turn.normalized_text(), "x" * 260)
             self.assertEqual(
                 [call.args[1] for call in bot._reply.await_args_list],
                 ["Sent to codex. I will post progress updates here."],
@@ -763,7 +972,7 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
             )
             service = Mock()
             service.launch_binding = AsyncMock(return_value=binding)
-            service.send_user_text = Mock()
+            service.send_user_turn = Mock()
             bot.service = service
 
             update = SimpleNamespace(
@@ -779,7 +988,10 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
                 mode="fresh",
             )
 
-            service.send_user_text.assert_called_once_with(binding, "hello from voice")
+            service.send_user_turn.assert_called_once()
+            sent_binding, sent_turn = service.send_user_turn.call_args.args
+            self.assertEqual(sent_binding.id, binding.id)
+            self.assertEqual(sent_turn.normalized_text(), "hello from voice")
             bot._reply.assert_awaited_once()
             reply_text = bot._reply.await_args.args[1]
             self.assertEqual(

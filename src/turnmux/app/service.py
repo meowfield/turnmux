@@ -7,11 +7,13 @@ import json
 from pathlib import Path
 from typing import Iterable
 
+from ..attachments import AttachmentStore, inline_excerpt
 from ..config import TurnmuxConfig, validate_repo_path
+from ..input_types import AttachmentRef, AttachmentMediaClass, UserTurn
 from ..providers import ProviderRegistry
 from ..providers.base import ProviderSession, ProviderTranscriptEvent, parse_timestamp
 from ..providers.trust import ensure_provider_trust
-from ..runtime.approvals import detect_approval_request
+from ..runtime.approvals import detect_approval_request, detect_non_approval_prompt_response
 from ..runtime import tmux
 from ..state.models import Binding, BindingStatus, ProviderName
 from ..state.repository import StateRepository
@@ -42,11 +44,14 @@ class AppService:
         repository: StateRepository,
         providers: ProviderRegistry,
         runtime_home: Path | None = None,
+        attachment_store: AttachmentStore | None = None,
     ) -> None:
         self.config = config
         self.repository = repository
         self.providers = providers
         self.runtime_home = runtime_home.expanduser().resolve(strict=False) if runtime_home is not None else None
+        self.attachment_store = attachment_store
+        self._auto_answered_prompt_fingerprints: set[tuple[int, str]] = set()
 
     def validate_repo(self, repo_path_text: str) -> Path:
         return validate_repo_path(Path(repo_path_text), self.config.allowed_roots)
@@ -197,16 +202,22 @@ class AppService:
         self.repository.delete_pending_launch(binding_id)
 
     def send_user_text(self, binding: Binding, text: str) -> None:
+        self.send_user_turn(binding, UserTurn(text=text))
+
+    def send_user_turn(self, binding: Binding, turn: UserTurn) -> None:
+        if not turn.has_content():
+            return
         if binding.status not in {BindingStatus.ACTIVE, BindingStatus.PENDING_START} or not binding.tmux_window_id:
             raise RuntimeError("This topic does not have an active runtime session yet.")
         if self.repository.get_pending_approval(binding.id) is not None:
             raise RuntimeError("This topic is waiting for an approval decision. Use the Telegram buttons first.")
+        rendered_text = self._render_turn_for_binding(binding, turn)
         if binding.status == BindingStatus.PENDING_START and not binding.provider_session_id and not binding.transcript_path:
             if self.repository.get_pending_launch(binding.id) is not None:
                 raise RuntimeError("The provider is still starting. Wait for the activation message before sending more text.")
-            self._launch_pending_fresh_binding(binding, text)
+            self._launch_pending_fresh_binding(binding, rendered_text)
             return
-        tmux.paste_text(binding.tmux_window_id, text, enter=True)
+        tmux.paste_text(binding.tmux_window_id, rendered_text, enter=True)
 
     def interrupt_binding(self, binding: Binding) -> None:
         if not binding.tmux_window_id:
@@ -216,6 +227,8 @@ class AppService:
     def kill_binding(self, binding: Binding) -> None:
         if binding.tmux_window_id:
             tmux.kill_window(binding.tmux_session_name, binding.tmux_window_id)
+        if self.attachment_store is not None:
+            self.attachment_store.clear_topic(binding.chat_id, binding.thread_id, repo_path=binding.repo_path)
         self.repository.delete_binding(binding.id)
 
     def _launch_pending_fresh_binding(self, binding: Binding, text: str) -> None:
@@ -238,6 +251,35 @@ class AppService:
             repo_path=binding.repo_path,
             started_at=started_after,
             discovery_deadline_at=(datetime.now(timezone.utc) + timedelta(seconds=DISCOVERY_TIMEOUT_SECONDS)).isoformat(),
+        )
+
+    def _render_turn_for_binding(self, binding: Binding, turn: UserTurn) -> str:
+        normalized_text = turn.normalized_text()
+        projected_attachments = tuple(
+            self._project_attachment_for_binding(binding, attachment)
+            for attachment in turn.attachments
+        )
+        if not projected_attachments:
+            return normalized_text or ""
+
+        sections: list[str] = []
+        if normalized_text:
+            sections.append(normalized_text)
+
+        attachment_lines = [f"TurnMux attached {len(projected_attachments)} file(s) for this message:"]
+        for index, attachment in enumerate(projected_attachments, start=1):
+            attachment_lines.extend(_render_attachment_block(binding.repo_path, index=index, attachment=attachment))
+        sections.append("\n".join(attachment_lines))
+        return "\n\n".join(section for section in sections if section.strip())
+
+    def _project_attachment_for_binding(self, binding: Binding, attachment: AttachmentRef) -> AttachmentRef:
+        if self.attachment_store is None:
+            return attachment
+        return self.attachment_store.project_attachment(
+            binding.repo_path,
+            chat_id=binding.chat_id,
+            thread_id=binding.thread_id,
+            attachment=attachment,
         )
 
     def status_text(self, binding: Binding) -> str:
@@ -306,6 +348,9 @@ class AppService:
         for pending in self.repository.list_pending_launches():
             binding = self.repository.get_binding_by_id(pending.binding_id)
             if binding is None:
+                self.repository.delete_pending_launch(pending.binding_id)
+                continue
+            if binding.status == BindingStatus.ACTIVE:
                 self.repository.delete_pending_launch(pending.binding_id)
                 continue
             session = self.providers.get(pending.provider).discover_session(
@@ -418,8 +463,18 @@ class AppService:
     def _sync_pending_approval(self, binding: Binding) -> OutboundMessage | None:
         assert binding.tmux_window_id is not None
         pane = tmux.capture_pane(binding.tmux_window_id, history_lines=120)
-        request = detect_approval_request(binding.provider, pane)
         current = self.repository.get_pending_approval(binding.id)
+        prompt_response = detect_non_approval_prompt_response(binding.provider, pane)
+        if prompt_response is not None:
+            prompt_key = (binding.id, prompt_response.fingerprint)
+            if prompt_key not in self._auto_answered_prompt_fingerprints:
+                tmux.send_keys(binding.tmux_window_id, *prompt_response.keys)
+                self._auto_answered_prompt_fingerprints.add(prompt_key)
+            if current is not None:
+                self.repository.delete_pending_approval(binding.id)
+            return None
+
+        request = detect_approval_request(binding.provider, pane)
         if request is None:
             if current is not None:
                 self.repository.delete_pending_approval(binding.id)
@@ -552,6 +607,42 @@ def _discover_git_repos(root: Path, *, max_depth: int) -> list[Path]:
             stack.append((child, depth + 1))
 
     return discovered
+
+
+def _render_attachment_block(repo_path: Path, *, index: int, attachment: AttachmentRef) -> list[str]:
+    lines = [f"[Attachment {index}]"]
+    lines.append(f"type: {attachment.media_class.value}")
+    if attachment.original_name:
+        lines.append(f"original_name: {attachment.original_name}")
+    if attachment.mime_type:
+        lines.append(f"mime: {attachment.mime_type}")
+    if attachment.file_size is not None:
+        lines.append(f"bytes: {attachment.file_size}")
+    lines.append(f"path: {_display_attachment_path(repo_path, attachment.local_path)}")
+
+    derived_excerpt = inline_excerpt(attachment.derived_text_path)
+    if attachment.derived_text_path is not None:
+        lines.append(f"derived_text_path: {_display_attachment_path(repo_path, attachment.derived_text_path)}")
+        if derived_excerpt:
+            lines.append("derived_text_excerpt:")
+            lines.append(derived_excerpt)
+    elif attachment.media_class == AttachmentMediaClass.IMAGE:
+        lines.append("note: inspect the image at the path above.")
+
+    metadata = attachment.metadata()
+    width = metadata.get("width")
+    height = metadata.get("height")
+    if isinstance(width, int) and isinstance(height, int):
+        lines.append(f"dimensions: {width}x{height}")
+    return lines
+
+
+def _display_attachment_path(repo_path: Path, path: Path) -> str:
+    normalized_path = path.expanduser().resolve(strict=False)
+    try:
+        return str(normalized_path.relative_to(repo_path))
+    except ValueError:
+        return str(normalized_path)
 
 
 def _repo_mtime(repo_path: Path) -> float:

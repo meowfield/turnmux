@@ -318,6 +318,13 @@ class StateRepository:
             ).fetchone()
         return _row_to_onboarding_state(row) if row else None
 
+    def list_onboarding_states(self) -> list[OnboardingState]:
+        with closing(connect(self.db_path)) as connection:
+            rows = connection.execute(
+                "SELECT * FROM onboarding_states ORDER BY updated_at DESC;"
+            ).fetchall()
+        return [_row_to_onboarding_state(row) for row in rows]
+
     def clear_onboarding_state(self, chat_id: int, thread_id: int) -> None:
         with closing(connect(self.db_path)) as connection:
             connection.execute(

@@ -46,6 +46,7 @@ class FakeTelegramClient:
     def __init__(self) -> None:
         self.sent_messages: list[SentTelegramMessage] = []
         self.topic_edits: list[tuple[int, int, str]] = []
+        self.chat_actions: list[tuple[int, int | None, str]] = []
 
     async def send_message(
         self,
@@ -65,6 +66,15 @@ class FakeTelegramClient:
 
     async def edit_forum_topic(self, *, chat_id: int, message_thread_id: int, name: str) -> None:
         self.topic_edits.append((chat_id, message_thread_id, name))
+
+    async def send_chat_action(
+        self,
+        *,
+        chat_id: int,
+        action: str,
+        message_thread_id: int | None = None,
+    ) -> None:
+        self.chat_actions.append((chat_id, message_thread_id, action))
 
 
 class FailOnceTelegramClient(FakeTelegramClient):

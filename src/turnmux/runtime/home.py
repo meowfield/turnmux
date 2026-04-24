@@ -13,6 +13,7 @@ PRIVATE_FILE_MODE = 0o600
 @dataclass(frozen=True, slots=True)
 class RuntimePaths:
     home: Path
+    tmp_dir: Path
     config_path: Path
     logs_dir: Path
     log_path: Path
@@ -24,10 +25,12 @@ class RuntimePaths:
 
 def initialize_runtime_home(base_dir: Path | None = None) -> RuntimePaths:
     home = ensure_private_directory(base_dir or DEFAULT_RUNTIME_HOME)
+    tmp_dir = ensure_private_directory(home / "tmp")
     logs_dir = ensure_private_directory(home / "logs")
 
     return RuntimePaths(
         home=home,
+        tmp_dir=tmp_dir,
         config_path=home / "config.toml",
         logs_dir=logs_dir,
         log_path=logs_dir / "turnmux.log",

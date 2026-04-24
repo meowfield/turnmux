@@ -11,6 +11,7 @@ from ..state.models import ProviderName
 OPTION_LINE_RE = re.compile(r"^\s*(?P<key>[0-9A-Za-z])(?:\s*[\).\]:-])\s+(?P<label>.+?)\s*$")
 BRACKET_OPTION_RE = re.compile(r"^\s*\[(?P<key>[0-9A-Za-z])\]\s*(?P<label>.+?)\s*$")
 YES_NO_RE = re.compile(r"\[(?P<yes>[Yy])(?:es)?\s*/\s*(?P<no>[Nn])(?:o)?\]")
+ENTER_ACTION_RE = re.compile(r"^\s*(?:press\s+)?enter\s+to\s+(?:approve|allow|accept|continue|run)\b", re.IGNORECASE)
 CLAUDE_ENTER_ESCAPE_TOP_PATTERNS = (
     re.compile(r"^\s*Do you want to proceed\?\s*$", re.IGNORECASE),
     re.compile(r"^\s*Do you want to make this edit", re.IGNORECASE),
@@ -31,6 +32,11 @@ APPROVAL_CONTEXT_PATTERNS = (
     "run this command",
     "execute this command",
     "continue with",
+)
+APPROVAL_STATUS_CONTEXT_PATTERNS = (
+    "approval policy",
+    "approval mode",
+    "--ask-for-approval",
 )
 APPROVE_LABEL_PATTERNS = (
     "approve",
@@ -60,6 +66,13 @@ class ApprovalRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class PromptResponse:
+    fingerprint: str
+    prompt_text: str
+    keys: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _OptionChoice:
     key: str
     label: str
@@ -82,6 +95,16 @@ def detect_approval_request(provider: ProviderName, pane_text: str) -> ApprovalR
         request = detector(provider, lines)
         if request is not None:
             return request
+    return None
+
+
+def detect_non_approval_prompt_response(provider: ProviderName, pane_text: str) -> PromptResponse | None:
+    lines = _clean_lines(pane_text)
+    if not lines:
+        return None
+
+    if provider == ProviderName.CODEX:
+        return _detect_codex_update_prompt(lines)
     return None
 
 
@@ -113,12 +136,36 @@ def _detect_claude_bypass_warning(provider: ProviderName, lines: list[str]) -> A
     )
 
 
+def _detect_codex_update_prompt(lines: list[str]) -> PromptResponse | None:
+    continue_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.lower() == "press enter to continue"
+        ),
+        None,
+    )
+    if continue_index is None:
+        return None
+
+    first_context_index = max(0, continue_index - 8)
+    context = lines[first_context_index : continue_index + 1]
+    joined = "\n".join(context).lower()
+    if "update available" not in joined or "release notes:" not in joined:
+        return None
+
+    choices = _parse_option_choices(context, base_index=first_context_index)
+    skip = next((choice for choice in choices if choice.label.lower() == "skip"), None)
+    if skip is None:
+        return None
+
+    prompt_text = _excerpt(lines, first_context_index, continue_index)
+    return _prompt_response(prompt_text, keys=("Down", "Enter"))
+
+
 def _detect_numbered_or_lettered_choices(provider: ProviderName, lines: list[str]) -> ApprovalRequest | None:
     choices = _parse_option_choices(lines)
     if not choices:
-        return None
-
-    if not _has_approval_context(lines):
         return None
 
     approve = next((choice for choice in choices if _matches_any(choice.label.lower(), APPROVE_LABEL_PATTERNS)), None)
@@ -128,6 +175,9 @@ def _detect_numbered_or_lettered_choices(provider: ProviderName, lines: list[str
 
     first_index = min(approve.line_index, deny.line_index)
     last_index = max(approve.line_index, deny.line_index)
+    if not _has_approval_context_near(lines, first_index, last_index):
+        return None
+
     prompt_text = _excerpt(lines, max(0, first_index - 3), min(len(lines) - 1, last_index + 2))
     return _approval_request(
         prompt_text,
@@ -167,12 +217,11 @@ def _detect_claude_enter_escape_prompt(provider: ProviderName, lines: list[str])
 
 
 def _detect_yes_no_prompt(provider: ProviderName, lines: list[str]) -> ApprovalRequest | None:
-    if not _has_approval_context(lines):
-        return None
-
     for index, line in enumerate(lines):
         match = YES_NO_RE.search(line)
         if match is None:
+            continue
+        if not _has_approval_context_near(lines, index, index):
             continue
         prompt_text = _excerpt(lines, max(0, index - 2), min(len(lines) - 1, index + 2))
         return _approval_request(
@@ -184,14 +233,11 @@ def _detect_yes_no_prompt(provider: ProviderName, lines: list[str]) -> ApprovalR
 
 
 def _detect_enter_escape_prompt(provider: ProviderName, lines: list[str]) -> ApprovalRequest | None:
-    if not _has_approval_context(lines):
-        return None
-
     for index, line in enumerate(lines):
         lower = line.lower()
-        if "enter" not in lower:
+        if ENTER_ACTION_RE.search(line) is None:
             continue
-        if not any(token in lower for token in ("approve", "allow", "accept", "continue", "run")):
+        if not _has_approval_context_near(lines, index, index):
             continue
 
         prompt_text = _excerpt(lines, max(0, index - 2), min(len(lines) - 1, index + 2))
@@ -230,8 +276,18 @@ def _parse_option_choices(lines: Iterable[str], *, base_index: int = 0) -> list[
 
 
 def _has_approval_context(lines: list[str]) -> bool:
-    joined = "\n".join(lines).lower()
+    joined = "\n".join(line for line in (line.lower() for line in lines) if not _is_approval_status_context(line))
     return any(pattern in joined for pattern in APPROVAL_CONTEXT_PATTERNS)
+
+
+def _has_approval_context_near(lines: list[str], start: int, end: int, *, radius: int = 3) -> bool:
+    return _has_approval_context(lines[max(0, start - radius) : min(len(lines), end + radius + 1)])
+
+
+def _is_approval_status_context(line: str) -> bool:
+    if not any(pattern in line for pattern in APPROVAL_STATUS_CONTEXT_PATTERNS):
+        return False
+    return not any(token in line for token in ("required", "requires", "approve", "allow", "deny"))
 
 
 def _matches_any(value: str, patterns: tuple[str, ...]) -> bool:
@@ -259,4 +315,16 @@ def _approval_request(prompt_text: str, *, approve_keys: tuple[str, ...], deny_k
         prompt_text=prompt_text,
         approve_keys=approve_keys,
         deny_keys=deny_keys,
+    )
+
+
+def _prompt_response(prompt_text: str, *, keys: tuple[str, ...]) -> PromptResponse:
+    digest = sha256()
+    digest.update(prompt_text.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(",".join(keys).encode("utf-8"))
+    return PromptResponse(
+        fingerprint=digest.hexdigest(),
+        prompt_text=prompt_text,
+        keys=keys,
     )

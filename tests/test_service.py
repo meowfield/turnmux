@@ -6,8 +6,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from turnmux.attachments import AttachmentStore
 from turnmux.app.service import AppService
 from turnmux.config import TurnmuxConfig
+from turnmux.input_types import UserTurn
 from turnmux.providers.base import ParseBatch, ProviderTranscriptEvent
 from turnmux.state.db import bootstrap_database
 from turnmux.state.models import BindingStatus, ProviderName
@@ -218,6 +220,100 @@ class AppServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "still starting"):
                 service.send_user_text(binding, "second message")
 
+    def test_send_user_turn_projects_attachment_into_repo_tmp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            runtime_home = base_dir / "runtime-home"
+            repo_path = base_dir / "repo"
+            repo_path.mkdir()
+            (repo_path / ".git").mkdir()
+            db_path = base_dir / "state.db"
+            bootstrap_database(db_path)
+            repository = StateRepository(db_path)
+            attachment_store = AttachmentStore(runtime_home)
+            service = AppService(
+                config=make_config(base_dir),
+                repository=repository,
+                providers=FakeRegistry(FakeAdapter()),
+                runtime_home=runtime_home,
+                attachment_store=attachment_store,
+            )
+            binding = repository.save_binding(
+                chat_id=1,
+                thread_id=10,
+                provider=ProviderName.CODEX,
+                repo_path=repo_path,
+                tmux_session_name="turnmux",
+                tmux_window_id="@12",
+                tmux_window_name="codex:repo",
+                status=BindingStatus.ACTIVE,
+            )
+            attachment = attachment_store.store_attachment(
+                1,
+                10,
+                original_name="notes.txt",
+                mime_type="text/plain",
+                payload=b"hello from file",
+                source_message_id=1,
+                source_kind="document",
+            )
+
+            with patch("turnmux.app.service.tmux.paste_text") as paste_text:
+                service.send_user_turn(binding, UserTurn(text="check file", attachments=(attachment,)))
+
+            pasted_prompt = paste_text.call_args.args[1]
+            self.assertIn("check file", pasted_prompt)
+            self.assertIn(".turnmux-tmp/turnmux-1-10", pasted_prompt)
+            self.assertTrue((repo_path / ".turnmux-tmp" / "turnmux-1-10").exists())
+
+    def test_kill_binding_clears_topic_tmp_and_repo_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            runtime_home = base_dir / "runtime-home"
+            repo_path = base_dir / "repo"
+            repo_path.mkdir()
+            (repo_path / ".git").mkdir()
+            db_path = base_dir / "state.db"
+            bootstrap_database(db_path)
+            repository = StateRepository(db_path)
+            attachment_store = AttachmentStore(runtime_home)
+            service = AppService(
+                config=make_config(base_dir),
+                repository=repository,
+                providers=FakeRegistry(FakeAdapter()),
+                runtime_home=runtime_home,
+                attachment_store=attachment_store,
+            )
+            binding = repository.save_binding(
+                chat_id=1,
+                thread_id=10,
+                provider=ProviderName.CODEX,
+                repo_path=repo_path,
+                tmux_session_name="turnmux",
+                tmux_window_id="@12",
+                tmux_window_name="codex:repo",
+                status=BindingStatus.ACTIVE,
+            )
+            attachment = attachment_store.store_attachment(
+                1,
+                10,
+                original_name="notes.txt",
+                mime_type="text/plain",
+                payload=b"hello from file",
+                source_message_id=1,
+                source_kind="document",
+            )
+            attachment_store.project_attachment(repo_path, chat_id=1, thread_id=10, attachment=attachment)
+            self.assertTrue(attachment_store.topic_dir(1, 10).exists())
+            self.assertTrue((repo_path / ".turnmux-tmp" / "turnmux-1-10").exists())
+
+            with patch("turnmux.app.service.tmux.kill_window") as kill_window:
+                service.kill_binding(binding)
+
+            kill_window.assert_called_once()
+            self.assertFalse(attachment_store.topic_dir(1, 10).exists())
+            self.assertFalse((repo_path / ".turnmux-tmp" / "turnmux-1-10").exists())
+
     def test_refresh_emits_pending_approval_once_and_resolves_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             base_dir = Path(tmp_dir)
@@ -271,6 +367,101 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(result, "Approval sent.")
             send_keys.assert_called_once_with("@12", "2", "Enter")
             self.assertIsNone(repository.get_pending_approval(binding.id))
+
+    def test_refresh_auto_skips_codex_update_prompt_without_approval_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            db_path = base_dir / "state.db"
+            bootstrap_database(db_path)
+            repository = StateRepository(db_path)
+            service = AppService(config=make_config(base_dir), repository=repository, providers=FakeRegistry(FakeAdapter()))
+
+            transcript_path = base_dir / "transcript.jsonl"
+            transcript_path.write_text("", encoding="utf-8")
+            binding = repository.save_binding(
+                chat_id=1,
+                thread_id=10,
+                provider=ProviderName.CODEX,
+                repo_path=base_dir,
+                tmux_session_name="turnmux",
+                tmux_window_id="@12",
+                tmux_window_name="codex:tmp",
+                provider_session_id="session-123",
+                transcript_path=transcript_path,
+                status=BindingStatus.ACTIVE,
+            )
+            repository.save_pending_approval(
+                binding_id=binding.id,
+                provider=ProviderName.CODEX,
+                fingerprint="old-false-positive",
+                prompt_text="2. Skip\n3. Skip until next version\nPress enter to continue",
+                approve_keys=("Enter",),
+            )
+
+            with (
+                patch("turnmux.app.service.tmux.window_exists", return_value=True),
+                patch(
+                    "turnmux.app.service.tmux.capture_pane",
+                    return_value=(
+                        "approval policy: on-request\n"
+                        "Update available! 0.122.0 -> 0.124.0\n"
+                        "Release notes: https://github.com/openai/codex/releases/latest\n"
+                        "› 1. Update now (runs `npm install -g @openai/codex`)\n"
+                        "2. Skip\n"
+                        "3. Skip until next version\n"
+                        "Press enter to continue\n"
+                    ),
+                ),
+                patch("turnmux.app.service.tmux.send_keys") as send_keys,
+            ):
+                outbound = service.refresh_pending_and_active_bindings()
+
+            self.assertEqual(outbound, [])
+            send_keys.assert_called_once_with("@12", "Down", "Enter")
+            self.assertIsNone(repository.get_pending_approval(binding.id))
+
+    def test_refresh_ignores_stale_pending_launch_for_active_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            db_path = base_dir / "state.db"
+            bootstrap_database(db_path)
+            repository = StateRepository(db_path)
+            service = AppService(config=make_config(base_dir), repository=repository, providers=FakeRegistry(FakeAdapter()))
+
+            transcript_path = base_dir / "transcript.jsonl"
+            transcript_path.write_text("", encoding="utf-8")
+            binding = repository.save_binding(
+                chat_id=1,
+                thread_id=10,
+                provider=ProviderName.CODEX,
+                repo_path=base_dir,
+                tmux_session_name="turnmux",
+                tmux_window_id="@12",
+                tmux_window_name="codex:tmp",
+                provider_session_id="session-123",
+                transcript_path=transcript_path,
+                status=BindingStatus.ACTIVE,
+            )
+            repository.save_pending_launch(
+                binding_id=binding.id,
+                provider=ProviderName.CODEX,
+                repo_path=base_dir,
+                started_at=(datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(),
+                discovery_deadline_at=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+            )
+
+            with (
+                patch("turnmux.app.service.tmux.window_exists", return_value=True),
+                patch("turnmux.app.service.tmux.capture_pane", return_value="Codex ready"),
+            ):
+                outbound = service.refresh_pending_and_active_bindings()
+
+            self.assertEqual(outbound, [])
+            self.assertIsNone(repository.get_pending_launch(binding.id))
+            rebound = repository.get_binding_by_id(binding.id)
+            self.assertIsNotNone(rebound)
+            assert rebound is not None
+            self.assertEqual(rebound.status, BindingStatus.ACTIVE)
 
     def test_send_user_text_rejects_pending_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

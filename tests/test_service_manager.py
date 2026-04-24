@@ -58,6 +58,48 @@ class ServiceManagerTests(unittest.TestCase):
             self.assertIn("PATH", payload["EnvironmentVariables"])
             self.assertIn("/opt/homebrew/bin", payload["EnvironmentVariables"]["PATH"])
 
+    def test_render_launch_agent_plist_passes_through_tmux_binary_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            runtime_paths = initialize_runtime_home(Path(tmp_dir) / ".turnmux")
+            spec = build_launch_agent_spec(
+                runtime_paths,
+                config_path=runtime_paths.config_path,
+                label="io.turnmux.test",
+                python_executable=Path("/usr/bin/python3"),
+                working_directory=Path(tmp_dir),
+            )
+
+            with patch.dict("os.environ", {"TURNMUX_TMUX_BINARY": "/tmp/tmux-wrapper"}):
+                payload = plistlib.loads(render_launch_agent_plist(spec))
+
+            self.assertEqual(payload["EnvironmentVariables"]["TURNMUX_TMUX_BINARY"], "/tmp/tmux-wrapper")
+
+    def test_render_launch_agent_plist_preserves_existing_tmux_binary_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            runtime_paths = initialize_runtime_home(Path(tmp_dir) / ".turnmux")
+            spec = build_launch_agent_spec(
+                runtime_paths,
+                config_path=runtime_paths.config_path,
+                label="io.turnmux.test",
+                python_executable=Path("/usr/bin/python3"),
+                working_directory=Path(tmp_dir),
+            )
+            spec.plist_path.parent.mkdir(parents=True, exist_ok=True)
+            spec.plist_path.write_bytes(
+                plistlib.dumps(
+                    {
+                        "EnvironmentVariables": {
+                            "TURNMUX_TMUX_BINARY": "/tmp/existing-tmux-wrapper",
+                        }
+                    }
+                )
+            )
+
+            with patch.dict("os.environ", {}, clear=True):
+                payload = plistlib.loads(render_launch_agent_plist(spec))
+
+            self.assertEqual(payload["EnvironmentVariables"]["TURNMUX_TMUX_BINARY"], "/tmp/existing-tmux-wrapper")
+
     def test_format_status_includes_heartbeat(self) -> None:
         status = LaunchAgentStatus(
             label="io.turnmux.bot",
