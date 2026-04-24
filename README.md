@@ -4,6 +4,7 @@ TurnMux binds a Telegram topic or private chat to a real local `tmux` window run
 
 ## Requirements
 
+- macOS. This is the only currently supported and tested target.
 - Python 3.12+
 - `tmux`
 - a Telegram bot token
@@ -11,6 +12,8 @@ TurnMux binds a Telegram topic or private chat to a real local `tmux` window run
   - Claude Code: [Anthropic CLI docs](https://code.claude.com/docs/en/cli-reference)
   - Codex CLI: [OpenAI Codex CLI docs](https://developers.openai.com/codex/cli)
   - OpenCode: [OpenCode CLI docs](https://opencode.ai/docs/cli/)
+
+Linux or WSL may work only as a best-effort foreground run if `tmux`, Python, Telegram networking, and the provider CLI all behave the same way. Native Windows is not supported.
 
 ## Install
 
@@ -64,9 +67,9 @@ This is the supported first-time install path.
    turnmux service status
    ```
 
-`turnmux init-config` writes a sample config with detected local defaults and comments out provider blocks it cannot find. `turnmux service status` reports the actual runtime home, heartbeat age, and launchd health for the installed service. The built-in `turnmux service ...` commands are macOS-only; on other systems, run `turnmux run` under your own supervisor.
+`turnmux init-config` writes a sample config with detected local defaults and comments out provider blocks it cannot find. `turnmux service status` reports the actual runtime home, heartbeat age, and launchd health for the installed service. The built-in `turnmux service ...` commands are macOS-only.
 
-TurnMux is currently maintained and tested on macOS first. Contributions that harden Linux, WSL, or Windows support are welcome, but they are not part of the supported path today.
+Contributions that harden Linux, WSL, or Windows support are welcome, but they are not part of the supported path today.
 
 ## Config Notes
 
