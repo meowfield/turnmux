@@ -60,7 +60,8 @@ def build_launch_agent_spec(
     python_executable: Path | None = None,
     working_directory: Path | None = None,
 ) -> LaunchAgentSpec:
-    executable = (python_executable or Path(sys.executable)).expanduser().resolve(strict=False)
+    raw_executable = (python_executable or Path(sys.executable)).expanduser()
+    executable = raw_executable if raw_executable.is_absolute() else (Path.cwd() / raw_executable)
     cwd = (working_directory or Path.cwd()).expanduser().resolve(strict=False)
     plist_path = launch_agent_path(label)
     return LaunchAgentSpec(

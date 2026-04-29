@@ -100,6 +100,27 @@ class ServiceManagerTests(unittest.TestCase):
 
             self.assertEqual(payload["EnvironmentVariables"]["TURNMUX_TMUX_BINARY"], "/tmp/existing-tmux-wrapper")
 
+    def test_build_launch_agent_spec_preserves_virtualenv_python_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            runtime_paths = initialize_runtime_home(base_dir / ".turnmux")
+            real_python = base_dir / "Cellar" / "python3.12"
+            real_python.parent.mkdir(parents=True)
+            real_python.write_text("", encoding="utf-8")
+            venv_python = base_dir / ".venv" / "bin" / "python"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.symlink_to(real_python)
+
+            spec = build_launch_agent_spec(
+                runtime_paths,
+                config_path=runtime_paths.config_path,
+                label="io.turnmux.test",
+                python_executable=venv_python,
+                working_directory=base_dir,
+            )
+
+            self.assertEqual(spec.program_arguments[0], str(venv_python))
+
     def test_format_status_includes_heartbeat(self) -> None:
         status = LaunchAgentStatus(
             label="io.turnmux.bot",
