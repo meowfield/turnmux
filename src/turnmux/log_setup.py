@@ -9,7 +9,7 @@ from .runtime.home import ensure_private_directory, set_private_file_permissions
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-_TELEGRAM_BOT_URL_TOKEN_RE = re.compile(r"(https://api\.telegram\.org/bot)\d{6,}:[A-Za-z0-9_-]+")
+_TELEGRAM_BOT_URL_TOKEN_RE = re.compile(r"(https://api\.telegram\.org/(?:file/)?bot)\d{6,}(?::|%3[Aa])[A-Za-z0-9_-]+")
 _TELEGRAM_BOT_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
 
 

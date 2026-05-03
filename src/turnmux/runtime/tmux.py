@@ -118,7 +118,7 @@ def paste_text(window_target: str, text: str, *, enter: bool = True, enter_delay
     pane_target = _active_pane_target(window_target)
     buffer_name = f"turnmux-{uuid4().hex}"
     _run_tmux(["load-buffer", "-b", buffer_name, "-"], input_text=text)
-    _run_tmux(["paste-buffer", "-b", buffer_name, "-d", "-t", pane_target])
+    _run_tmux(["paste-buffer", "-p", "-r", "-b", buffer_name, "-d", "-t", pane_target])
     if enter:
         if enter_delay_seconds > 0:
             time.sleep(enter_delay_seconds)

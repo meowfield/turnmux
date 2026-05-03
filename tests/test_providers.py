@@ -78,7 +78,7 @@ class ClaudeAdapterTests(unittest.TestCase):
             repo_path.mkdir()
 
             claude_root = tmp_path / ".claude"
-            project_dir = claude_root / "projects" / str(repo_path.resolve()).replace("/", "-")
+            project_dir = claude_root / "projects" / ClaudeAdapter._project_dir_name(repo_path)
             project_dir.mkdir(parents=True)
             transcript_path = project_dir / "session-claude.jsonl"
             transcript_path.write_text(
@@ -109,7 +109,7 @@ class ClaudeAdapterTests(unittest.TestCase):
             repo_path.mkdir()
 
             claude_root = tmp_path / ".claude"
-            project_dir = claude_root / "projects" / str(repo_path.resolve()).replace("/", "-")
+            project_dir = claude_root / "projects" / ClaudeAdapter._project_dir_name(repo_path)
             project_dir.mkdir(parents=True)
             transcript_path = project_dir / "session-claude.jsonl"
             transcript_path.write_text(
@@ -136,7 +136,7 @@ class ClaudeAdapterTests(unittest.TestCase):
             repo_path.mkdir()
 
             claude_root = tmp_path / ".claude"
-            project_dir = claude_root / "projects" / str(repo_path.resolve()).replace("/", "-")
+            project_dir = claude_root / "projects" / ClaudeAdapter._project_dir_name(repo_path)
             project_dir.mkdir(parents=True)
             transcript_path = project_dir / "session-claude.jsonl"
             transcript_path.write_text(
@@ -163,7 +163,7 @@ class ClaudeAdapterTests(unittest.TestCase):
             repo_path.mkdir()
 
             claude_root = tmp_path / ".claude"
-            project_dir = claude_root / "projects" / str(repo_path.resolve()).replace("/", "-")
+            project_dir = claude_root / "projects" / ClaudeAdapter._project_dir_name(repo_path)
             project_dir.mkdir(parents=True)
             transcript_path = project_dir / "session-claude.jsonl"
             transcript_path.write_text(
@@ -185,7 +185,7 @@ class ClaudeAdapterTests(unittest.TestCase):
             runtime_home = tmp_path / "runtime-home"
 
             claude_root = tmp_path / ".claude"
-            project_dir = claude_root / "projects" / str(repo_path.resolve()).replace("/", "-")
+            project_dir = claude_root / "projects" / ClaudeAdapter._project_dir_name(repo_path)
             project_dir.mkdir(parents=True)
             transcript_path = project_dir / "session-hooked.jsonl"
             transcript_path.write_text(
@@ -220,7 +220,7 @@ class ClaudeAdapterTests(unittest.TestCase):
             repo_path.mkdir()
 
             claude_root = tmp_path / ".claude"
-            project_dir = claude_root / "projects" / str(repo_path.resolve()).replace("/", "-")
+            project_dir = claude_root / "projects" / ClaudeAdapter._project_dir_name(repo_path)
             project_dir.mkdir(parents=True)
             nested_dir = tmp_path / "nested"
             nested_dir.mkdir()

@@ -6,10 +6,36 @@ import shutil
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from turnmux.runtime import tmux
+
+
+class TmuxRuntimeUnitTests(unittest.TestCase):
+    def test_paste_text_preserves_multiline_payload_as_bracketed_paste(self) -> None:
+        calls = []
+
+        def fake_run_tmux(args, *, check=True, input_text=None):
+            calls.append((list(args), input_text))
+            if args[:3] == ["display-message", "-p", "-t"]:
+                return SimpleNamespace(returncode=0, stdout="%7\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("turnmux.runtime.tmux._run_tmux", side_effect=fake_run_tmux):
+            tmux.paste_text("@7", "first line\nsecond line", enter=True, enter_delay_seconds=0.0)
+
+        load_call = calls[1]
+        paste_call = calls[2]
+        send_enter_call = calls[3]
+
+        self.assertEqual(load_call[0][0], "load-buffer")
+        self.assertEqual(load_call[1], "first line\nsecond line")
+        self.assertEqual(paste_call[0][:3], ["paste-buffer", "-p", "-r"])
+        self.assertIn("-d", paste_call[0])
+        self.assertEqual(send_enter_call[0], ["send-keys", "-t", "%7", "Enter"])
 
 
 def _tmux_integration_available() -> bool:
