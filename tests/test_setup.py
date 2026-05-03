@@ -30,9 +30,10 @@ class SetupHelpersTests(unittest.TestCase):
             self.assertIn('openai_base_url = "https://api.openai.com/v1"', rendered)
             self.assertIn('openai_transcription_model = "gpt-4o-transcribe"', rendered)
 
-    def test_render_sample_config_prefers_git_root(self) -> None:
+    def test_render_sample_config_uses_git_parent_as_browsable_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            repo_root = Path(tmp_dir) / "workspace" / "repo"
+            workspace_root = Path(tmp_dir) / "workspace"
+            repo_root = workspace_root / "repo"
             nested_dir = repo_root / "src" / "turnmux"
             nested_dir.mkdir(parents=True)
             (repo_root / ".git").mkdir()
@@ -40,7 +41,7 @@ class SetupHelpersTests(unittest.TestCase):
 
             rendered = render_sample_config(runtime_paths, working_dir=nested_dir)
 
-            self.assertIn(f'allowed_roots = ["{repo_root.resolve(strict=False)}"]', rendered)
+            self.assertIn(f'allowed_roots = ["{workspace_root.resolve(strict=False)}"]', rendered)
 
     def test_write_sample_config_writes_file_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

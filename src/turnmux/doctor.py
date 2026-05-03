@@ -79,7 +79,7 @@ def render_sample_config(runtime_paths: RuntimePaths, *, working_dir: Path | Non
 
         telegram_bot_token = "{TOKEN_PLACEHOLDER}"
         allowed_user_ids = [{USER_ID_PLACEHOLDER}]
-        # Start narrow. Add more roots only if you intentionally want broader access.
+        # Start with the workspace containing this checkout. Add roots only if you intentionally want broader access.
         allowed_roots = ["{allowed_root}"]
         tmux_session_name = "turnmux"
 
@@ -298,6 +298,9 @@ def _recommended_allowed_root(working_dir: Path | None) -> Path:
     candidate = (working_dir or Path.cwd()).expanduser().resolve(strict=False)
     git_root = _discover_git_root(candidate)
     if git_root is not None:
+        parent = git_root.parent.resolve(strict=False)
+        if parent != parent.parent:
+            return parent
         return git_root
     if candidate.is_dir():
         return candidate

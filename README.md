@@ -37,7 +37,7 @@ This is the supported first-time install path.
 
 2. Edit `~/.turnmux/config.toml`:
    - replace `telegram_bot_token` and `allowed_user_ids`
-   - keep `allowed_roots` narrow
+   - keep `allowed_roots` narrow; when run inside a git repo, `init-config` starts with that repo's parent workspace so the Telegram browser can open sibling repos
    - configure at least one provider command
 
 3. Bootstrap the runtime state:
@@ -105,7 +105,7 @@ codex_command = [
 
 Notes:
 
-- `allowed_roots` must contain absolute directories. TurnMux rejects repo paths outside them.
+- `allowed_roots` must contain absolute directories. TurnMux rejects repo paths outside them, and the Telegram folder browser cannot navigate above those roots.
 - TurnMux keeps runtime state in `~/.turnmux/`, including `config.toml`, `logs/turnmux.log`, `state.db`, and `heartbeat.json`.
 - Telegram needs plain text delivery. Either disable privacy mode in `@BotFather` or add the bot as an admin in the target supergroup.
 - Forum supergroups with topics are the best fit for parallel sessions. Private chats work too, but only support one live binding at a time.
