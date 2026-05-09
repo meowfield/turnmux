@@ -27,6 +27,8 @@ class SetupHelpersTests(unittest.TestCase):
             self.assertIn("on-request", rendered)
             self.assertIn("danger-full-access", rendered)
             self.assertIn("--no-alt-screen", rendered)
+            self.assertIn("Optional: add `--model`, `gpt-5.5`", rendered)
+            self.assertIn("Without `--model`, Codex uses ~/.codex/config.toml", rendered)
             self.assertIn('openai_base_url = "https://api.openai.com/v1"', rendered)
             self.assertIn('openai_transcription_model = "gpt-4o-transcribe"', rendered)
 

@@ -60,6 +60,10 @@ def render_sample_config(runtime_paths: RuntimePaths, *, working_dir: Path | Non
         "codex_command",
         [detected_codex_binary or "codex", "--ask-for-approval", "on-request", "--sandbox", "danger-full-access", "--no-alt-screen"],
         enabled=detected_codex_binary is not None,
+        leading_lines=[
+            "Optional: add `--model`, `gpt-5.5` here to pin TurnMux to a specific Codex model.",
+            "Without `--model`, Codex uses ~/.codex/config.toml or its CLI default.",
+        ],
     )
     opencode_block = _render_command_block(
         "OpenCode",
@@ -385,6 +389,7 @@ def _render_command_block(
     *,
     enabled: bool,
     optional: bool = False,
+    leading_lines: list[str] | None = None,
     trailing_lines: list[str] | None = None,
 ) -> str:
     prefix = "" if enabled else "# "
@@ -393,7 +398,10 @@ def _render_command_block(
         header = f"# Optional: {provider_name} provider."
     if not enabled:
         header = f"{header} Uncomment if you want to expose {provider_name}."
-    lines = [header, f"{prefix}{field_name} = ["]
+    lines = [header]
+    for leading in leading_lines or ():
+        lines.append(f"# {leading}")
+    lines.append(f"{prefix}{field_name} = [")
     for token in command:
         lines.append(f'{prefix}  "{token}",')
     lines.append(f"{prefix}]")

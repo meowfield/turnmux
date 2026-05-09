@@ -83,6 +83,10 @@ claude_command = [
 
 codex_command = [
   "codex",
+  # Optional: pin TurnMux to a specific Codex model instead of
+  # inheriting the user's ~/.codex/config.toml or Codex CLI default.
+  # "--model",
+  # "gpt-5.5",
   "--ask-for-approval",
   "on-request",
   "--sandbox",
@@ -107,6 +111,7 @@ Notes:
 
 - `allowed_roots` must contain absolute directories. TurnMux rejects repo paths outside them, and the Telegram folder browser cannot navigate above those roots.
 - TurnMux keeps runtime state in `~/.turnmux/`, including `config.toml`, `logs/turnmux.log`, `state.db`, and `heartbeat.json`.
+- Codex model selection is a Codex CLI setting. If `codex_command` does not include `--model`, Codex uses the user's `~/.codex/config.toml` or its own default. Add `--model <model>` to `codex_command` only when you want TurnMux to use a fixed model regardless of the user's global Codex config.
 - Telegram needs plain text delivery. Either disable privacy mode in `@BotFather` or add the bot as an admin in the target supergroup.
 - Forum supergroups with topics are the best fit for parallel sessions. Private chats work too, but only support one live binding at a time.
 - On first launch, TurnMux marks supported workspaces as trusted in local provider state so `tmux` startup can stay non-interactive.
