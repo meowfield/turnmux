@@ -364,6 +364,56 @@ class CodexAdapterTests(unittest.TestCase):
             self.assertIn("resume", command)
             self.assertIn("session-codex", command)
 
+    def test_discover_requested_session_waits_for_resume_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            repo_path = tmp_path / "repo"
+            repo_path.mkdir()
+
+            codex_root = tmp_path / ".codex"
+            sessions_dir = codex_root / "sessions" / "2026" / "04" / "20"
+            sessions_dir.mkdir(parents=True)
+            session_index = codex_root / "session_index.jsonl"
+            session_index.parent.mkdir(parents=True, exist_ok=True)
+            session_index.write_text(
+                '{"id":"session-codex","thread_name":"Resume task","updated_at":"2026-04-20T10:05:00Z"}\n',
+                encoding="utf-8",
+            )
+
+            rollout_path = sessions_dir / "rollout-2026-04-20T10-00-00-session-codex.jsonl"
+            rollout_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    {{"type":"session_meta","timestamp":"2026-04-20T10:00:00Z","payload":{{"id":"session-codex","cwd":"{repo_path.resolve()}","timestamp":"2026-04-20T10:00:00Z"}}}}
+                    {{"type":"response_item","timestamp":"2026-04-20T10:01:00Z","payload":{{"type":"message","role":"assistant","phase":"final_answer","content":[{{"type":"output_text","text":"Old answer"}}]}}}}
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            adapter = CodexAdapter(make_config(tmp_path), codex_home=codex_root)
+            stale = adapter.discover_session(
+                repo_path,
+                started_after="2026-04-20T10:06:00+00:00",
+                requested_session_id="session-codex",
+            )
+            self.assertIsNone(stale)
+
+            session_index.write_text(
+                '{"id":"session-codex","thread_name":"Resume task","updated_at":"2026-04-20T10:06:01Z"}\n',
+                encoding="utf-8",
+            )
+
+            resumed = adapter.discover_session(
+                repo_path,
+                started_after="2026-04-20T10:06:00+00:00",
+                requested_session_id="session-codex",
+            )
+            self.assertIsNotNone(resumed)
+            assert resumed is not None
+            self.assertEqual(resumed.transcript_path, rollout_path)
+
     def test_falls_back_to_first_user_prompt_when_thread_name_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

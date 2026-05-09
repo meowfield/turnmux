@@ -104,6 +104,9 @@ def detect_non_approval_prompt_response(provider: ProviderName, pane_text: str) 
         return None
 
     if provider == ProviderName.CODEX:
+        model_upgrade_response = _detect_codex_model_upgrade_prompt(lines)
+        if model_upgrade_response is not None:
+            return model_upgrade_response
         return _detect_codex_update_prompt(lines)
     return None
 
@@ -160,6 +163,28 @@ def _detect_codex_update_prompt(lines: list[str]) -> PromptResponse | None:
         return None
 
     prompt_text = _excerpt(lines, first_context_index, continue_index)
+    return _prompt_response(prompt_text, keys=("Down", "Enter"))
+
+
+def _detect_codex_model_upgrade_prompt(lines: list[str]) -> PromptResponse | None:
+    intro_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.lower().startswith("introducing gpt-")
+        ),
+        None,
+    )
+    if intro_index is None:
+        return None
+
+    end_index = min(len(lines) - 1, intro_index + 14)
+    context = lines[intro_index : end_index + 1]
+    joined = "\n".join(context).lower()
+    if "choose how you'd like codex to proceed" not in joined or "use existing model" not in joined:
+        return None
+
+    prompt_text = _excerpt(lines, intro_index, end_index)
     return _prompt_response(prompt_text, keys=("Down", "Enter"))
 
 

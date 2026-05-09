@@ -52,9 +52,11 @@ class CodexAdapter(ProviderAdapter):
             session = self._session_from_rollout(transcript_path, repo_path, index)
             if not session:
                 continue
-            if requested_session_id and session.session_id == requested_session_id:
-                return session
             updated_at_dt = parse_timestamp(session.updated_at)
+            if requested_session_id and session.session_id == requested_session_id:
+                if not started_after_dt or (updated_at_dt and updated_at_dt >= started_after_dt):
+                    return session
+                continue
             if not requested_session_id and started_after_dt and updated_at_dt and updated_at_dt >= started_after_dt:
                 return session
         return None

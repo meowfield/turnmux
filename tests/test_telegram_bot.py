@@ -6,6 +6,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
+from telegram.error import TimedOut
 
 from turnmux.app.service import OutboundMessage
 from turnmux.config import TurnmuxConfig
@@ -228,6 +229,42 @@ class TelegramBotKillTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelegramBotApprovalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_onboarding_callback_continues_when_answer_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            bootstrap_database(root / "state.db")
+            config = TurnmuxConfig(
+                telegram_bot_token="token",
+                allowed_user_ids=(1,),
+                allowed_roots=(root,),
+                tmux_session_name="turnmux",
+                claude_command=("claude",),
+                codex_command=("codex",),
+                opencode_command=None,
+                opencode_model=None,
+                config_path=root / "config.toml",
+                relay_claude_thinking=False,
+            )
+            repository = StateRepository(root / "state.db")
+            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config))
+            bot._ensure_allowed = AsyncMock(return_value=True)  # type: ignore[method-assign]
+            bot._handle_new = AsyncMock()  # type: ignore[method-assign]
+
+            update = SimpleNamespace(
+                effective_user=SimpleNamespace(id=1),
+                effective_chat=SimpleNamespace(id=-100123, type="supergroup", is_forum=True),
+                effective_message=SimpleNamespace(message_thread_id=42),
+                callback_query=SimpleNamespace(
+                    data="ob:new",
+                    answer=AsyncMock(side_effect=TimedOut("timed out")),
+                    message=None,
+                ),
+            )
+
+            await bot._handle_onboarding_callback(update, None)
+
+            bot._handle_new.assert_awaited_once_with(update, None)
+
     async def test_approval_callback_routes_decision_to_service(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -280,6 +317,38 @@ class TelegramBotApprovalTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelegramTypingIndicatorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reply_retries_once_after_telegram_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            bootstrap_database(root / "state.db")
+            config = TurnmuxConfig(
+                telegram_bot_token="token",
+                allowed_user_ids=(1,),
+                allowed_roots=(root,),
+                tmux_session_name="turnmux",
+                claude_command=("claude",),
+                codex_command=("codex",),
+                opencode_command=None,
+                opencode_model=None,
+                config_path=root / "config.toml",
+                relay_claude_thinking=False,
+            )
+            repository = StateRepository(root / "state.db")
+            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config))
+
+            telegram_client = SimpleNamespace(send_message=AsyncMock(side_effect=[TimedOut("timed out"), None]))
+            update = SimpleNamespace(
+                effective_chat=SimpleNamespace(id=-100123),
+                effective_message=SimpleNamespace(
+                    message_thread_id=42,
+                    get_bot=lambda: telegram_client,
+                ),
+            )
+
+            await bot._reply(update, "done")
+
+            self.assertEqual(telegram_client.send_message.await_count, 2)
+
     async def test_route_incoming_text_starts_typing_indicator_for_active_binding(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

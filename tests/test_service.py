@@ -169,9 +169,16 @@ class AppServiceTests(unittest.TestCase):
                 discovery_deadline_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
             )
 
-            outbound = service.refresh_pending_and_active_bindings()
+            with patch(
+                "turnmux.app.service.tmux.capture_pane",
+                return_value="starting provider\nError: Operation not permitted (os error 1)\n",
+            ):
+                outbound = service.refresh_pending_and_active_bindings()
+
             self.assertEqual(len(outbound), 1)
             self.assertIn("discovery timeout", outbound[0].text)
+            self.assertIn("Last tmux output:", outbound[0].text)
+            self.assertIn("Error: Operation not permitted", outbound[0].text)
             refreshed = repository.get_binding_by_id(binding.id)
             assert refreshed is not None
             self.assertEqual(refreshed.status, BindingStatus.MISSING)
@@ -219,6 +226,40 @@ class AppServiceTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "still starting"):
                 service.send_user_text(binding, "second message")
+
+    def test_send_user_text_blocks_pending_resume_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            db_path = base_dir / "state.db"
+            bootstrap_database(db_path)
+            repository = StateRepository(db_path)
+            service = AppService(config=make_config(base_dir), repository=repository, providers=FakeRegistry(FakeAdapter()))
+
+            binding = repository.save_binding(
+                chat_id=1,
+                thread_id=10,
+                provider=ProviderName.CODEX,
+                repo_path=base_dir,
+                tmux_session_name="turnmux",
+                tmux_window_id="@11",
+                tmux_window_name="codex:tmp",
+                provider_session_id="session-123",
+                transcript_path=None,
+                status=BindingStatus.PENDING_START,
+            )
+            repository.save_pending_launch(
+                binding_id=binding.id,
+                provider=ProviderName.CODEX,
+                repo_path=base_dir,
+                discovery_deadline_at=(datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+                requested_session_id="session-123",
+            )
+
+            with patch("turnmux.app.service.tmux.paste_text") as paste_text:
+                with self.assertRaisesRegex(RuntimeError, "still starting"):
+                    service.send_user_text(binding, "do not paste into shell")
+
+            paste_text.assert_not_called()
 
     def test_send_user_turn_projects_attachment_into_repo_tmp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

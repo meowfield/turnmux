@@ -20,6 +20,8 @@ from ..state.repository import StateRepository
 
 
 DISCOVERY_TIMEOUT_SECONDS = 90
+DISCOVERY_FAILURE_PANE_LINES = 12
+DISCOVERY_FAILURE_PANE_CHARS = 1200
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,11 +214,13 @@ class AppService:
         if self.repository.get_pending_approval(binding.id) is not None:
             raise RuntimeError("This topic is waiting for an approval decision. Use the Telegram buttons first.")
         rendered_text = self._render_turn_for_binding(binding, turn)
-        if binding.status == BindingStatus.PENDING_START and not binding.provider_session_id and not binding.transcript_path:
-            if self.repository.get_pending_launch(binding.id) is not None:
+        if binding.status == BindingStatus.PENDING_START:
+            pending_launch = self.repository.get_pending_launch(binding.id)
+            if pending_launch is not None:
                 raise RuntimeError("The provider is still starting. Wait for the activation message before sending more text.")
-            self._launch_pending_fresh_binding(binding, rendered_text)
-            return
+            if not binding.provider_session_id and not binding.transcript_path:
+                self._launch_pending_fresh_binding(binding, rendered_text)
+                return
         tmux.paste_text(binding.tmux_window_id, rendered_text, enter=True)
 
     def interrupt_binding(self, binding: Binding) -> None:
@@ -383,7 +387,7 @@ class AppService:
                     OutboundMessage(
                         chat_id=binding.chat_id,
                         thread_id=binding.thread_id,
-                        text="Session did not expose a transcript before the discovery timeout. Binding marked as missing.",
+                        text=_format_discovery_timeout_message(binding),
                     )
                 )
 
@@ -526,6 +530,32 @@ def _format_history_event(event: ProviderTranscriptEvent) -> str:
 
 def _format_transcript_event_message(event: ProviderTranscriptEvent) -> str:
     return event.text
+
+
+def _format_discovery_timeout_message(binding: Binding) -> str:
+    base = "Session did not expose a transcript before the discovery timeout. Binding marked as missing."
+    if not binding.tmux_window_id:
+        return base
+
+    try:
+        pane = tmux.capture_pane(binding.tmux_window_id, history_lines=DISCOVERY_FAILURE_PANE_LINES)
+    except Exception:
+        return base
+
+    excerpt = _last_non_empty_lines(pane)
+    if not excerpt:
+        return base
+    return f"{base}\n\nLast tmux output:\n{excerpt}"
+
+
+def _last_non_empty_lines(text: str) -> str:
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    excerpt = "\n".join(lines[-DISCOVERY_FAILURE_PANE_LINES:]).strip()
+    if len(excerpt) <= DISCOVERY_FAILURE_PANE_CHARS:
+        return excerpt
+    return "..." + excerpt[-DISCOVERY_FAILURE_PANE_CHARS:]
 
 
 def decode_repo_candidates(value: str | None) -> list[Path]:

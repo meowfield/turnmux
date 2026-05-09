@@ -144,6 +144,26 @@ class ApprovalDetectionTests(unittest.TestCase):
         self.assertEqual(response.keys, ("Down", "Enter"))
         self.assertIn("Update available", response.prompt_text)
 
+    def test_codex_model_upgrade_prompt_uses_existing_model(self) -> None:
+        response = detect_non_approval_prompt_response(
+            ProviderName.CODEX,
+            (
+                "Introducing GPT-5.4\n"
+                "Codex just got an upgrade with GPT-5.4, our most capable model for professional work.\n"
+                "Learn more: https://openai.com/index/introducing-gpt-5-4\n"
+                "You can always keep using GPT-5.3-Codex if you prefer.\n"
+                "Choose how you'd like Codex to proceed.\n"
+                "› 1. Try new model\n"
+                "  2. Use existing model\n"
+                "Use ↑/↓ to move, press enter to confirm\n"
+            ),
+        )
+
+        self.assertIsNotNone(response)
+        assert response is not None
+        self.assertEqual(response.keys, ("Down", "Enter"))
+        self.assertIn("Introducing GPT-5.4", response.prompt_text)
+
     def test_ignores_regular_transcript_text(self) -> None:
         request = detect_approval_request(
             ProviderName.CODEX,

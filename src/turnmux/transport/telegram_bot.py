@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Iterable
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
+from telegram.error import TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from ..attachments import AttachmentStore
@@ -36,6 +36,8 @@ from ..state.repository import StateRepository
 
 
 logger = logging.getLogger(__name__)
+TELEGRAM_REPLY_ATTEMPTS = 2
+TELEGRAM_REPLY_RETRY_DELAY_SECONDS = 1.0
 CONTROL_COMMANDS = {
     "/start",
     "/new",
@@ -493,7 +495,7 @@ class TurnmuxTelegramBot:
         query = update.callback_query
         if query is None or query.data is None:
             return
-        await query.answer()
+        await _answer_callback_query(query)
 
         # Inline keyboard callbacks use a compact protocol:
         # `ob:<action>:...` for onboarding and `ap:<action>:...` for approvals.
@@ -663,7 +665,7 @@ class TurnmuxTelegramBot:
         query = update.callback_query
         if query is None or query.data is None:
             return
-        await query.answer()
+        await _answer_callback_query(query)
 
         payload = query.data.split(":")
         if len(payload) < 2 or payload[1] not in {"approve", "deny"}:
@@ -1218,7 +1220,8 @@ class TurnmuxTelegramBot:
             return
         chat_id, thread_id = topic_key(update)
         for index, chunk in enumerate(split_text(text)):
-            await message.get_bot().send_message(
+            await _send_reply_message(
+                message.get_bot(),
                 chat_id=chat_id,
                 text=chunk,
                 message_thread_id=thread_id or None,
@@ -1286,6 +1289,43 @@ async def send_thread_message(bot_or_application, *, chat_id: int, thread_id: in
             reply_markup=reply_markup,
         )
         reply_markup = None
+
+
+async def _send_reply_message(
+    bot,
+    *,
+    chat_id: int,
+    text: str,
+    message_thread_id: int | None,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> None:
+    for attempt in range(1, TELEGRAM_REPLY_ATTEMPTS + 1):
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                message_thread_id=message_thread_id,
+                reply_markup=reply_markup,
+            )
+            return
+        except TimedOut:
+            if attempt >= TELEGRAM_REPLY_ATTEMPTS:
+                raise
+            logger.warning(
+                "Telegram reply timed out; retrying chat_id=%s thread_id=%s attempt=%s/%s",
+                chat_id,
+                message_thread_id,
+                attempt + 1,
+                TELEGRAM_REPLY_ATTEMPTS,
+            )
+            await asyncio.sleep(TELEGRAM_REPLY_RETRY_DELAY_SECONDS)
+
+
+async def _answer_callback_query(query) -> None:
+    try:
+        await query.answer()
+    except TelegramError as exc:
+        logger.warning("Telegram callback answer failed; continuing: %s", exc)
 
 
 class UnsupportedAttachmentError(RuntimeError):
