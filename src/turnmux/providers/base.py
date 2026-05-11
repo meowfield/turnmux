@@ -53,6 +53,9 @@ class ProviderAdapter(ABC):
     def initial_monitor_offset(self, session: ProviderSession) -> int:
         return session.transcript_path.stat().st_size if session.transcript_path.exists() else 0
 
+    def is_runtime_ready(self, pane_text: str) -> bool:
+        return True
+
     @abstractmethod
     def build_start_command(self, repo_path: Path, *, initial_prompt: str | None = None) -> list[str]:
         raise NotImplementedError

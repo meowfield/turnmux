@@ -54,12 +54,25 @@ class CodexAdapter(ProviderAdapter):
                 continue
             updated_at_dt = parse_timestamp(session.updated_at)
             if requested_session_id and session.session_id == requested_session_id:
-                if not started_after_dt or (updated_at_dt and updated_at_dt >= started_after_dt):
-                    return session
-                continue
+                return session
             if not requested_session_id and started_after_dt and updated_at_dt and updated_at_dt >= started_after_dt:
                 return session
         return None
+
+    def is_runtime_ready(self, pane_text: str) -> bool:
+        lines = [line.strip() for line in pane_text.splitlines() if line.strip()]
+        tail = lines[-12:]
+        if any(_is_codex_blocking_prompt(line) for line in tail):
+            return False
+
+        prompt_index = next(
+            (index for index in range(len(tail) - 1, -1, -1) if tail[index].startswith("›")),
+            None,
+        )
+        if prompt_index is None:
+            return False
+        status_window = tail[prompt_index + 1 : prompt_index + 4]
+        return any(_is_codex_status_line(candidate) for candidate in status_window)
 
     def parse_new_events(self, transcript_path: Path, offset: int, *, session_id: str | None = None) -> ParseBatch:
         records, new_offset = read_jsonl_tail(transcript_path, offset)
@@ -89,6 +102,33 @@ class CodexAdapter(ProviderAdapter):
                                 is_final=payload.get("phase") != "commentary",
                             )
                         )
+
+            elif record_type == "event_msg" and payload.get("type") == "task_complete":
+                if payload.get("last_agent_message") is None:
+                    events.append(
+                        ProviderTranscriptEvent(
+                            role="assistant",
+                            content_type="diagnostic_no_answer",
+                            text="Codex finished the turn without producing an answer (likely quota, rate limit, or API error).",
+                            timestamp=timestamp,
+                            is_final=True,
+                        )
+                    )
+
+            elif record_type == "event_msg" and payload.get("type") == "turn_aborted":
+                reason = payload.get("reason")
+                # `interrupted` means the user pressed Ctrl-C (or /interrupt) and
+                # already knows. Only report aborts caused by something else.
+                if isinstance(reason, str) and reason and reason != "interrupted":
+                    events.append(
+                        ProviderTranscriptEvent(
+                            role="assistant",
+                            content_type="diagnostic_aborted",
+                            text=f"Codex turn was aborted (reason: {reason}).",
+                            timestamp=timestamp,
+                            is_final=True,
+                        )
+                    )
 
         return ParseBatch(
             events=tuple(events),
@@ -187,6 +227,19 @@ def _ensure_no_alt_screen(command: tuple[str, ...] | list[str]) -> list[str]:
     if "--no-alt-screen" not in normalized:
         normalized.append("--no-alt-screen")
     return normalized
+
+
+_CODEX_STATUS_MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4", "codex")
+
+
+def _is_codex_status_line(line: str) -> bool:
+    if " · " not in line:
+        return False
+    return line.startswith(_CODEX_STATUS_MODEL_PREFIXES)
+
+
+def _is_codex_blocking_prompt(line: str) -> bool:
+    return "Press enter to continue" in line or "Update available!" in line
 
 
 def build_codex_compatible_command(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
@@ -7,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from turnmux.attachments import AttachmentStore
-from turnmux.app.service import AppService
+from turnmux.app.service import AppService, _format_transcript_event_message
 from turnmux.config import TurnmuxConfig
 from turnmux.input_types import UserTurn
 from turnmux.providers.base import ParseBatch, ProviderTranscriptEvent
@@ -37,6 +38,9 @@ class FakeAdapter:
 
     def initial_monitor_offset(self, session) -> int:
         return 0
+
+    def is_runtime_ready(self, pane_text: str) -> bool:
+        return True
 
     def build_start_command(self, repo_path: Path, *, initial_prompt: str | None = None) -> list[str]:
         command = ["fake-provider", str(repo_path)]
@@ -71,6 +75,58 @@ class FakeRegistry:
 
     def get(self, provider: ProviderName) -> FakeAdapter:
         return self.adapter
+
+
+class FormatTranscriptEventMessageTests(unittest.TestCase):
+    def _binding_with_window(self, window_id: str | None) -> object:
+        from types import SimpleNamespace
+        return SimpleNamespace(tmux_window_id=window_id, tmux_session_name="turnmux")
+
+    def test_passes_through_text_event_unchanged(self) -> None:
+        event = ProviderTranscriptEvent(
+            role="assistant", content_type="text", text="hello", timestamp=None, is_final=True
+        )
+        self.assertEqual(_format_transcript_event_message(event), "hello")
+
+    def test_diagnostic_appends_pane_tail_when_binding_has_window(self) -> None:
+        event = ProviderTranscriptEvent(
+            role="assistant",
+            content_type="diagnostic_no_answer",
+            text="Codex finished without answer.",
+            timestamp=None,
+            is_final=True,
+        )
+        binding = self._binding_with_window("@99")
+        pane = "boot output\n\nERROR: 429 You exceeded your usage limit\n\n"
+        with patch("turnmux.app.service.tmux.capture_pane", return_value=pane) as cap:
+            text = _format_transcript_event_message(event, binding=binding)
+        cap.assert_called_once_with("@99", history_lines=80)
+        self.assertIn("⚠️ Codex finished without answer.", text)
+        self.assertIn("Last tmux output:", text)
+        self.assertIn("ERROR: 429 You exceeded your usage limit", text)
+
+    def test_diagnostic_falls_back_when_pane_capture_fails(self) -> None:
+        event = ProviderTranscriptEvent(
+            role="assistant",
+            content_type="diagnostic_aborted",
+            text="Codex turn was aborted (reason: network_error).",
+            timestamp=None,
+            is_final=True,
+        )
+        binding = self._binding_with_window("@99")
+        with patch("turnmux.app.service.tmux.capture_pane", side_effect=RuntimeError("no tmux")):
+            text = _format_transcript_event_message(event, binding=binding)
+        self.assertEqual(text, "⚠️ Codex turn was aborted (reason: network_error).")
+
+    def test_diagnostic_without_binding_only_prefixes_warning_glyph(self) -> None:
+        event = ProviderTranscriptEvent(
+            role="assistant",
+            content_type="diagnostic_no_answer",
+            text="x",
+            timestamp=None,
+            is_final=True,
+        )
+        self.assertEqual(_format_transcript_event_message(event), "⚠️ x")
 
 
 class AppServiceTests(unittest.TestCase):
@@ -137,11 +193,42 @@ class AppServiceTests(unittest.TestCase):
                 discovery_deadline_at=(datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
             )
 
-            with patch("turnmux.app.service.tmux.kill_window") as kill_window:
+            with (
+                patch("turnmux.app.service.tmux.window_exists", return_value=True),
+                patch("turnmux.app.service.tmux.kill_window") as kill_window,
+            ):
                 service.kill_binding(binding)
 
             kill_window.assert_called_once()
             self.assertEqual(repository.list_pending_launches(), [])
+            self.assertIsNone(repository.get_binding_by_id(binding.id))
+
+    def test_kill_binding_clears_state_when_tmux_window_is_already_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            db_path = base_dir / "state.db"
+            bootstrap_database(db_path)
+            repository = StateRepository(db_path)
+            service = AppService(config=make_config(base_dir), repository=repository, providers=FakeRegistry(FakeAdapter()))
+
+            binding = repository.save_binding(
+                chat_id=1,
+                thread_id=10,
+                provider=ProviderName.CODEX,
+                repo_path=base_dir,
+                tmux_session_name="turnmux",
+                tmux_window_id="@404",
+                tmux_window_name="codex:tmp",
+                status=BindingStatus.MISSING,
+            )
+
+            with (
+                patch("turnmux.app.service.tmux.window_exists", return_value=False),
+                patch("turnmux.app.service.tmux.kill_window") as kill_window,
+            ):
+                service.kill_binding(binding)
+
+            kill_window.assert_not_called()
             self.assertIsNone(repository.get_binding_by_id(binding.id))
 
     def test_refresh_marks_expired_pending_launch_missing(self) -> None:
@@ -261,6 +348,69 @@ class AppServiceTests(unittest.TestCase):
 
             paste_text.assert_not_called()
 
+    def test_wait_until_runtime_ready_polls_pane_until_adapter_ready(self) -> None:
+        class ReadyAdapter(FakeAdapter):
+            def is_runtime_ready(self, pane_text: str) -> bool:
+                return "READY" in pane_text
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            db_path = base_dir / "state.db"
+            bootstrap_database(db_path)
+            repository = StateRepository(db_path)
+            service = AppService(config=make_config(base_dir), repository=repository, providers=FakeRegistry(ReadyAdapter()))
+            binding = repository.save_binding(
+                chat_id=1,
+                thread_id=10,
+                provider=ProviderName.CODEX,
+                repo_path=base_dir,
+                tmux_session_name="turnmux",
+                tmux_window_id="@12",
+                tmux_window_name="codex:tmp",
+                status=BindingStatus.ACTIVE,
+            )
+
+            with (
+                patch("turnmux.app.service.tmux.window_exists", return_value=True),
+                patch("turnmux.app.service.tmux.capture_pane", side_effect=["booting", "READY\n› \n  gpt-5.5 xhigh · ~/repo"]) as capture_pane,
+            ):
+                asyncio.run(
+                    service.wait_until_runtime_ready(
+                        binding,
+                        timeout_seconds=1.0,
+                        poll_interval_seconds=0.0,
+                    )
+                )
+
+            self.assertEqual(capture_pane.call_count, 2)
+
+    def test_wait_until_runtime_ready_fails_when_tmux_window_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            db_path = base_dir / "state.db"
+            bootstrap_database(db_path)
+            repository = StateRepository(db_path)
+            service = AppService(config=make_config(base_dir), repository=repository, providers=FakeRegistry(FakeAdapter()))
+            binding = repository.save_binding(
+                chat_id=1,
+                thread_id=10,
+                provider=ProviderName.CODEX,
+                repo_path=base_dir,
+                tmux_session_name="turnmux",
+                tmux_window_id="@12",
+                tmux_window_name="codex:tmp",
+                status=BindingStatus.ACTIVE,
+            )
+
+            with (
+                patch("turnmux.app.service.tmux.window_exists", return_value=False),
+                patch("turnmux.app.service.tmux.capture_pane") as capture_pane,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "tmux window is missing"):
+                    asyncio.run(service.wait_until_runtime_ready(binding, timeout_seconds=0.1, poll_interval_seconds=0.0))
+
+            capture_pane.assert_not_called()
+
     def test_send_user_turn_projects_attachment_into_repo_tmp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             base_dir = Path(tmp_dir)
@@ -348,7 +498,10 @@ class AppServiceTests(unittest.TestCase):
             self.assertTrue(attachment_store.topic_dir(1, 10).exists())
             self.assertTrue((repo_path / ".turnmux-tmp" / "turnmux-1-10").exists())
 
-            with patch("turnmux.app.service.tmux.kill_window") as kill_window:
+            with (
+                patch("turnmux.app.service.tmux.window_exists", return_value=True),
+                patch("turnmux.app.service.tmux.kill_window") as kill_window,
+            ):
                 service.kill_binding(binding)
 
             kill_window.assert_called_once()

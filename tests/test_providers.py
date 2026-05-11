@@ -364,7 +364,7 @@ class CodexAdapterTests(unittest.TestCase):
             self.assertIn("resume", command)
             self.assertIn("session-codex", command)
 
-    def test_discover_requested_session_waits_for_resume_activity(self) -> None:
+    def test_discover_requested_session_returns_existing_resume_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             repo_path = tmp_path / "repo"
@@ -393,18 +393,6 @@ class CodexAdapterTests(unittest.TestCase):
             )
 
             adapter = CodexAdapter(make_config(tmp_path), codex_home=codex_root)
-            stale = adapter.discover_session(
-                repo_path,
-                started_after="2026-04-20T10:06:00+00:00",
-                requested_session_id="session-codex",
-            )
-            self.assertIsNone(stale)
-
-            session_index.write_text(
-                '{"id":"session-codex","thread_name":"Resume task","updated_at":"2026-04-20T10:06:01Z"}\n',
-                encoding="utf-8",
-            )
-
             resumed = adapter.discover_session(
                 repo_path,
                 started_after="2026-04-20T10:06:00+00:00",
@@ -413,6 +401,171 @@ class CodexAdapterTests(unittest.TestCase):
             self.assertIsNotNone(resumed)
             assert resumed is not None
             self.assertEqual(resumed.transcript_path, rollout_path)
+
+    def test_parses_task_complete_with_null_message_as_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            repo_path = tmp_path / "repo"
+            repo_path.mkdir()
+            codex_root = tmp_path / ".codex"
+            sessions_dir = codex_root / "sessions" / "2026" / "05" / "11"
+            sessions_dir.mkdir(parents=True)
+            rollout_path = sessions_dir / "rollout.jsonl"
+            rollout_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    {{"type":"session_meta","timestamp":"2026-05-11T11:25:00Z","payload":{{"id":"sid","cwd":"{repo_path.resolve()}","timestamp":"2026-05-11T11:25:00Z"}}}}
+                    {{"type":"event_msg","timestamp":"2026-05-11T11:25:28Z","payload":{{"type":"task_started","turn_id":"t1"}}}}
+                    {{"type":"response_item","timestamp":"2026-05-11T11:25:28Z","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"привет"}}]}}}}
+                    {{"type":"event_msg","timestamp":"2026-05-11T11:26:03Z","payload":{{"type":"task_complete","turn_id":"t1","last_agent_message":null,"completed_at":1778498763,"duration_ms":35131}}}}
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            adapter = CodexAdapter(make_config(tmp_path), codex_home=codex_root)
+            batch = adapter.parse_new_events(rollout_path, 0)
+
+            self.assertEqual(len(batch.events), 1)
+            event = batch.events[0]
+            self.assertEqual(event.role, "assistant")
+            self.assertEqual(event.content_type, "diagnostic_no_answer")
+            self.assertTrue(event.is_final)
+            self.assertIn("without producing an answer", event.text)
+
+    def test_task_complete_with_assistant_message_does_not_emit_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            repo_path = tmp_path / "repo"
+            repo_path.mkdir()
+            codex_root = tmp_path / ".codex"
+            sessions_dir = codex_root / "sessions" / "2026" / "05" / "11"
+            sessions_dir.mkdir(parents=True)
+            rollout_path = sessions_dir / "rollout.jsonl"
+            rollout_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    {{"type":"session_meta","timestamp":"2026-05-11T12:00:00Z","payload":{{"id":"sid","cwd":"{repo_path.resolve()}","timestamp":"2026-05-11T12:00:00Z"}}}}
+                    {{"type":"response_item","timestamp":"2026-05-11T12:00:10Z","payload":{{"type":"message","role":"assistant","phase":"final_answer","content":[{{"type":"output_text","text":"Привет!"}}]}}}}
+                    {{"type":"event_msg","timestamp":"2026-05-11T12:00:11Z","payload":{{"type":"task_complete","turn_id":"t2","last_agent_message":"Привет!","completed_at":1,"duration_ms":1}}}}
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            adapter = CodexAdapter(make_config(tmp_path), codex_home=codex_root)
+            batch = adapter.parse_new_events(rollout_path, 0)
+
+            self.assertEqual([event.content_type for event in batch.events], ["text"])
+            self.assertEqual(batch.events[0].text, "Привет!")
+
+    def test_turn_aborted_emits_diagnostic_unless_user_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            repo_path = tmp_path / "repo"
+            repo_path.mkdir()
+            codex_root = tmp_path / ".codex"
+            sessions_dir = codex_root / "sessions" / "2026" / "05" / "11"
+            sessions_dir.mkdir(parents=True)
+            rollout_path = sessions_dir / "rollout.jsonl"
+            rollout_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    {{"type":"session_meta","timestamp":"2026-05-11T12:30:00Z","payload":{{"id":"sid","cwd":"{repo_path.resolve()}","timestamp":"2026-05-11T12:30:00Z"}}}}
+                    {{"type":"event_msg","timestamp":"2026-05-11T12:30:01Z","payload":{{"type":"turn_aborted","turn_id":"t3","reason":"interrupted"}}}}
+                    {{"type":"event_msg","timestamp":"2026-05-11T12:31:00Z","payload":{{"type":"turn_aborted","turn_id":"t4","reason":"network_error"}}}}
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            adapter = CodexAdapter(make_config(tmp_path), codex_home=codex_root)
+            batch = adapter.parse_new_events(rollout_path, 0)
+
+            self.assertEqual(len(batch.events), 1)
+            event = batch.events[0]
+            self.assertEqual(event.content_type, "diagnostic_aborted")
+            self.assertIn("network_error", event.text)
+
+    def test_codex_runtime_ready_requires_current_prompt_and_status_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            adapter = CodexAdapter(make_config(Path(tmp_dir)), codex_home=Path(tmp_dir) / ".codex")
+
+            real_pane = (
+                "\n"
+                "╭─────────────────────────────────────────────╮\n"
+                "│ >_ OpenAI Codex (v0.130.0)                  │\n"
+                "│                                             │\n"
+                "│ model:     gpt-5.5 xhigh   /model to change │\n"
+                "│ directory: ~/Documents/turnmux              │\n"
+                "╰─────────────────────────────────────────────╯\n"
+                "\n"
+                "  Tip: GPT-5.5 is now available in Codex.\n"
+                "\n"
+                "  Learn more: https://openai.com/index/introducing-gpt-5-5/\n"
+                "\n"
+                "⚠ Under-development features enabled: chronicle.\n"
+                "  Users/danis/.codex/config.toml.\n"
+                "\n"
+                "\n"
+                "› Use /skills to list available skills\n"
+                "\n"
+                "  gpt-5.5 xhigh · ~/Documents/turnmux\n"
+            )
+            self.assertTrue(adapter.is_runtime_ready(real_pane))
+
+            self.assertTrue(
+                adapter.is_runtime_ready(
+                    "Previous output\n"
+                    "› \n"
+                    "  gpt-5.5 xhigh · ~/Documents/turnmux\n"
+                )
+            )
+            self.assertFalse(
+                adapter.is_runtime_ready(
+                    "› old prompt from visible history\n"
+                    "assistant output\n"
+                    "Starting Codex...\n"
+                )
+            )
+            self.assertFalse(
+                adapter.is_runtime_ready(
+                    "Update available! 0.122.0 -> 0.124.0\n"
+                    "Press enter to continue\n"
+                    "› 1. Update now\n"
+                )
+            )
+
+            # An old `›` higher in scrollback must not be treated as the live prompt
+            # if the live prompt below it has no status line yet.
+            self.assertFalse(
+                adapter.is_runtime_ready(
+                    "› old prompt with completed turn below\n"
+                    "  gpt-5.5 xhigh · ~/Documents/turnmux\n"
+                    "› still booting next prompt\n"
+                    "loading model list...\n"
+                )
+            )
+
+            # `output: …` and other lines that happen to start with the letter 'o'
+            # must not satisfy the status-line heuristic.
+            self.assertFalse(
+                adapter.is_runtime_ready(
+                    "› \n"
+                    "output: starting · please wait\n"
+                )
+            )
+
+            # `o3` / `o4-mini` style status lines must still satisfy the heuristic.
+            self.assertTrue(
+                adapter.is_runtime_ready(
+                    "› \n"
+                    "  o3 high · ~/Documents/turnmux\n"
+                )
+            )
 
     def test_falls_back_to_first_user_prompt_when_thread_name_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

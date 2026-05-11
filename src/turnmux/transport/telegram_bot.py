@@ -220,12 +220,7 @@ class TurnmuxTelegramBot:
             return
         if await self._maybe_redirect_new_session_to_topic(update, mode="fresh"):
             return
-        if _is_private_chat(update) and self._binding_for_update(update):
-            await self._reply(
-                update,
-                "This private chat already has a live binding.\n"
-                "For multiple parallel sessions, use TurnMux in a forum supergroup with one topic per session.",
-            )
+        if await self._private_live_binding_blocks_setup(update):
             return
         chat_id, thread_id = topic_key(update)
         self.repository.save_onboarding_state(
@@ -245,12 +240,7 @@ class TurnmuxTelegramBot:
             return
         if await self._maybe_redirect_new_session_to_topic(update, mode="resume"):
             return
-        if _is_private_chat(update) and self._binding_for_update(update):
-            await self._reply(
-                update,
-                "This private chat already has a live binding.\n"
-                "For multiple parallel sessions, use TurnMux in a forum supergroup with one topic per session.",
-            )
+        if await self._private_live_binding_blocks_setup(update):
             return
         chat_id, thread_id = topic_key(update)
         self.repository.save_onboarding_state(
@@ -264,6 +254,22 @@ class TurnmuxTelegramBot:
             "Choose which provider you want to resume in this topic.",
             reply_markup=_build_provider_keyboard(self.available_providers),
         )
+
+    async def _private_live_binding_blocks_setup(self, update: Update) -> bool:
+        if not _is_private_chat(update):
+            return False
+        binding = self._binding_for_update(update)
+        if binding is None:
+            return False
+        if binding.status in {BindingStatus.ACTIVE, BindingStatus.PENDING_START}:
+            await self._reply(
+                update,
+                "This private chat already has a live binding.\n"
+                "For multiple parallel sessions, use TurnMux in a forum supergroup with one topic per session.",
+            )
+            return True
+        self.service.kill_binding(binding)
+        return False
 
     async def _handle_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ensure_allowed(update):
@@ -960,11 +966,15 @@ class TurnmuxTelegramBot:
             await self._reply(update, f"Failed to launch {provider.value}: {exc}")
             return
         auto_sent = False
-        if pending_turn and mode == "fresh":
+        send_error: str | None = None
+        if pending_turn and mode in {"fresh", "resume"}:
             try:
+                if mode == "resume":
+                    await self.service.wait_until_runtime_ready(binding)
                 self.service.send_user_turn(binding, pending_turn)
                 auto_sent = True
-            except Exception:
+            except Exception as exc:
+                send_error = str(exc)
                 logger.exception("Failed to auto-send saved first message")
         self.repository.clear_onboarding_state(chat_id, thread_id)
         if not auto_sent and self.attachment_store is not None:
@@ -973,6 +983,8 @@ class TurnmuxTelegramBot:
         status_note = f"Started {provider.value} for `{repo_label}`."
         if auto_sent:
             status_note += f"\n{_format_sent_turn_message(provider, pending_turn)}"
+        elif pending_turn and send_error:
+            status_note += f"\nSaved first message was not sent: {send_error}"
         elif mode == "fresh" and binding.status == BindingStatus.PENDING_START:
             status_note += "\nSend the first message in this topic to start the session."
         elif binding.status == BindingStatus.PENDING_START:

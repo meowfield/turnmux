@@ -194,6 +194,59 @@ class RepoBrowserTests(unittest.TestCase):
 
 
 class TelegramBotKillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resume_in_private_chat_clears_missing_binding_before_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            repo_path = root / "turnmux"
+            repo_path.mkdir()
+            (repo_path / ".git").mkdir()
+            bootstrap_database(root / "state.db")
+            config = TurnmuxConfig(
+                telegram_bot_token="token",
+                allowed_user_ids=(1,),
+                allowed_roots=(root,),
+                tmux_session_name="turnmux",
+                claude_command=("claude",),
+                codex_command=("codex",),
+                opencode_command=None,
+                opencode_model=None,
+                config_path=root / "config.toml",
+                relay_claude_thinking=False,
+            )
+            repository = StateRepository(root / "state.db")
+            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config))
+            bot._ensure_allowed = AsyncMock(return_value=True)  # type: ignore[method-assign]
+            bot._reply = AsyncMock()  # type: ignore[method-assign]
+            service = Mock()
+            service.kill_binding = Mock(side_effect=lambda binding: repository.delete_binding(binding.id))
+            bot.service = service
+
+            binding = repository.save_binding(
+                chat_id=1,
+                thread_id=0,
+                provider=ProviderName.CODEX,
+                repo_path=repo_path,
+                tmux_session_name="turnmux",
+                tmux_window_id="@404",
+                tmux_window_name="codex:turnmux",
+                status=BindingStatus.MISSING,
+            )
+            update = SimpleNamespace(
+                effective_user=SimpleNamespace(id=1),
+                effective_chat=SimpleNamespace(id=1, type="private", is_forum=False),
+                effective_message=SimpleNamespace(message_thread_id=None),
+            )
+
+            await bot._handle_resume(update, None)
+
+            service.kill_binding.assert_called_once_with(binding)
+            self.assertEqual(bot._reply.await_args.args[1], "Choose which provider you want to resume in this topic.")
+            onboarding = repository.get_onboarding_state(1, 0)
+            self.assertIsNotNone(onboarding)
+            assert onboarding is not None
+            self.assertEqual(onboarding.step, OnboardingStep.CHOOSE_PROVIDER)
+            self.assertEqual(onboarding.mode, "resume")
+
     async def test_kill_deletes_unbound_named_topic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -1066,4 +1119,92 @@ class TelegramBotAudioTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 reply_text,
                 f'Started codex for `{root.name}/turnmux`.\nSent to codex: "hello from voice"',
+            )
+
+    async def test_launch_from_onboarding_auto_sends_saved_first_message_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            repo_path = root / "turnmux"
+            repo_path.mkdir()
+            (repo_path / ".git").mkdir()
+            transcript_path = root / "session.jsonl"
+            transcript_path.write_text("", encoding="utf-8")
+            bootstrap_database(root / "state.db")
+            config = TurnmuxConfig(
+                telegram_bot_token="token",
+                allowed_user_ids=(1,),
+                allowed_roots=(root,),
+                tmux_session_name="turnmux",
+                claude_command=("claude",),
+                codex_command=("codex",),
+                opencode_command=None,
+                opencode_model=None,
+                config_path=root / "config.toml",
+                relay_claude_thinking=False,
+            )
+            repository = StateRepository(root / "state.db")
+            bot = TurnmuxTelegramBot(config=config, repository=repository, providers=ProviderRegistry(config))
+            bot._reply = AsyncMock()  # type: ignore[method-assign]
+            bot._maybe_name_topic = AsyncMock()  # type: ignore[method-assign]
+
+            repository.save_onboarding_state(
+                chat_id=-100123,
+                thread_id=42,
+                step=OnboardingStep.CHOOSE_RESUME,
+                provider=ProviderName.CODEX,
+                repo_path=repo_path,
+                mode="resume",
+                pending_user_text=_encode_pending_state(seed_text="resume this task"),
+            )
+
+            binding = repository.save_binding(
+                chat_id=-100123,
+                thread_id=42,
+                provider=ProviderName.CODEX,
+                repo_path=repo_path,
+                tmux_session_name="turnmux",
+                tmux_window_id="@9",
+                tmux_window_name="codex:turnmux",
+                status=BindingStatus.ACTIVE,
+                provider_session_id="session-123",
+                transcript_path=transcript_path,
+            )
+            service = Mock()
+            service.launch_binding = AsyncMock(return_value=binding)
+            call_order: list[str] = []
+
+            async def wait_until_ready(_binding) -> None:
+                call_order.append("wait")
+
+            def send_user_turn(_binding, _turn) -> None:
+                call_order.append("send")
+
+            service.wait_until_runtime_ready = AsyncMock(side_effect=wait_until_ready)
+            service.send_user_turn = Mock()
+            service.send_user_turn.side_effect = send_user_turn
+            bot.service = service
+
+            update = SimpleNamespace(
+                effective_user=SimpleNamespace(id=1),
+                effective_chat=SimpleNamespace(id=-100123, type="supergroup", is_forum=True),
+                effective_message=SimpleNamespace(message_thread_id=42),
+            )
+
+            await bot._launch_from_onboarding(
+                update,
+                provider=ProviderName.CODEX,
+                repo_path=repo_path,
+                mode="resume",
+                requested_session_id="session-123",
+            )
+
+            service.wait_until_runtime_ready.assert_awaited_once_with(binding)
+            service.send_user_turn.assert_called_once()
+            self.assertEqual(call_order, ["wait", "send"])
+            sent_binding, sent_turn = service.send_user_turn.call_args.args
+            self.assertEqual(sent_binding.id, binding.id)
+            self.assertEqual(sent_turn.normalized_text(), "resume this task")
+            self.assertEqual(
+                bot._reply.await_args.args[1],
+                f'Started codex for `{root.name}/turnmux`.\nSent to codex: "resume this task"',
             )

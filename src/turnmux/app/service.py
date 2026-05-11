@@ -22,6 +22,8 @@ from ..state.repository import StateRepository
 DISCOVERY_TIMEOUT_SECONDS = 90
 DISCOVERY_FAILURE_PANE_LINES = 12
 DISCOVERY_FAILURE_PANE_CHARS = 1200
+RUNTIME_READY_TIMEOUT_SECONDS = 30.0
+RUNTIME_READY_POLL_SECONDS = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +225,29 @@ class AppService:
                 return
         tmux.paste_text(binding.tmux_window_id, rendered_text, enter=True)
 
+    async def wait_until_runtime_ready(
+        self,
+        binding: Binding,
+        *,
+        timeout_seconds: float = RUNTIME_READY_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = RUNTIME_READY_POLL_SECONDS,
+    ) -> None:
+        if not binding.tmux_window_id:
+            raise RuntimeError("Binding has no tmux window.")
+
+        adapter = self.providers.get(binding.provider)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            if not tmux.window_exists(binding.tmux_session_name, binding.tmux_window_id):
+                raise RuntimeError("tmux window is missing.")
+            pane = tmux.capture_pane(binding.tmux_window_id, history_lines=120)
+            if adapter.is_runtime_ready(pane):
+                return
+            if loop.time() >= deadline:
+                raise RuntimeError("Provider runtime did not become ready before timeout.")
+            await asyncio.sleep(poll_interval_seconds)
+
     def interrupt_binding(self, binding: Binding) -> None:
         if not binding.tmux_window_id:
             raise RuntimeError("Binding has no tmux window.")
@@ -230,7 +255,11 @@ class AppService:
 
     def kill_binding(self, binding: Binding) -> None:
         if binding.tmux_window_id:
-            tmux.kill_window(binding.tmux_session_name, binding.tmux_window_id)
+            try:
+                if tmux.window_exists(binding.tmux_session_name, binding.tmux_window_id):
+                    tmux.kill_window(binding.tmux_session_name, binding.tmux_window_id)
+            except tmux.TmuxError:
+                pass
         if self.attachment_store is not None:
             self.attachment_store.clear_topic(binding.chat_id, binding.thread_id, repo_path=binding.repo_path)
         self.repository.delete_binding(binding.id)
@@ -446,7 +475,7 @@ class AppService:
                         OutboundMessage(
                             chat_id=binding.chat_id,
                             thread_id=binding.thread_id,
-                            text=_format_transcript_event_message(event),
+                            text=_format_transcript_event_message(event, binding=binding),
                             binding_id=binding.id,
                             next_byte_offset=batch.new_offset,
                             last_event_ts=batch.last_event_ts,
@@ -528,8 +557,21 @@ def _format_history_event(event: ProviderTranscriptEvent) -> str:
     return f"[{event.role}] {event.text}"
 
 
-def _format_transcript_event_message(event: ProviderTranscriptEvent) -> str:
-    return event.text
+def _format_transcript_event_message(event: ProviderTranscriptEvent, *, binding: Binding | None = None) -> str:
+    if not event.content_type.startswith("diagnostic"):
+        return event.text
+
+    header = f"⚠️ {event.text}"
+    if binding is None or not binding.tmux_window_id:
+        return header
+    try:
+        pane = tmux.capture_pane(binding.tmux_window_id, history_lines=80)
+    except Exception:
+        return header
+    excerpt = _last_non_empty_lines(pane)
+    if not excerpt:
+        return header
+    return f"{header}\n\nLast tmux output:\n{excerpt}"
 
 
 def _format_discovery_timeout_message(binding: Binding) -> str:
